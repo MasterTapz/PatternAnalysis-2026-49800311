@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from torch.utils.data import Dataset
 
 PRICE_SCALE = 10_000             # LOBSTER stores dollars times 10,000
 TICK = 0.01                      # AMZN minimum price increment in dollars
@@ -281,3 +282,195 @@ def decode_book(
         bid_price=bid_price,
         bid_size=sizes[:, levels:],
     )
+
+
+# ---------------------------------------------------------------------------
+# Scaling and windowing
+# ---------------------------------------------------------------------------
+
+class FeatureScaler:
+    """Per-feature scaling fitted on the training period only.
+
+    "minmax" maps each training feature to [0, 1], matching the sigmoid output
+    of the TimeGAN recovery network. "standard" gives zero mean and unit
+    variance. Validation and test data are transformed with the training
+    statistics, so values outside the training range there signal genuine
+    distribution shift rather than being hidden by a refit.
+    """
+
+    METHODS = ("minmax", "standard")
+
+    def __init__(self, method: str = "minmax", eps: float = 1e-8):
+        if method not in self.METHODS:
+            raise ValueError(f"method must be one of {self.METHODS}")
+        self.method = method
+        self.eps = eps
+        self.shift: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
+
+    def fit(self, x: torch.Tensor) -> "FeatureScaler":
+        x = x.double()
+        if self.method == "minmax":
+            self.shift = x.amin(dim=0)
+            self.scale = x.amax(dim=0) - self.shift
+        else:
+            self.shift = x.mean(dim=0)
+            self.scale = x.std(dim=0)
+        self.scale = self.scale.clamp_min(self.eps)
+        return self
+
+    def _check_fitted(self) -> None:
+        if self.shift is None:
+            raise RuntimeError("FeatureScaler must be fitted first")
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        self._check_fitted()
+        return (x.double() - self.shift) / self.scale
+
+    def inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
+        self._check_fitted()
+        return x.double() * self.scale + self.shift
+
+    def state_dict(self) -> dict:
+        self._check_fitted()
+        return {"method": self.method, "eps": self.eps, "shift": self.shift, "scale": self.scale}
+
+    @classmethod
+    def from_state_dict(cls, state: dict) -> "FeatureScaler":
+        scaler = cls(state["method"], state["eps"])
+        scaler.shift, scaler.scale = state["shift"], state["scale"]
+        return scaler
+
+
+class LOBWindowDataset(Dataset):
+    """Fixed-length windows over one contiguous period, served as float32.
+
+    Windows are slices of a single stored tensor rather than copies, so a
+    stride of 1 costs no extra memory. prev_mid[j] is the mid-price just before
+    feature row j, which decode_book needs to rebuild absolute prices.
+    """
+
+    def __init__(self, features: torch.Tensor, prev_mid: torch.Tensor, time: torch.Tensor,
+                 seq_len: int, stride: int = 1):
+        if not len(features) == len(prev_mid) == len(time):
+            raise ValueError("features, prev_mid and time must have the same length")
+        if len(features) < seq_len:
+            raise ValueError(f"Period has {len(features)} rows, fewer than seq_len={seq_len}")
+        self.features = features.float().contiguous()
+        self.prev_mid = prev_mid.double()
+        self.time = time.double()
+        self.seq_len = seq_len
+        self.stride = stride
+        self.starts = torch.arange(0, len(features) - seq_len + 1, stride)
+
+    def __len__(self) -> int:
+        return len(self.starts)
+
+    def __getitem__(self, i: int) -> torch.Tensor:
+        s = int(self.starts[i])
+        return self.features[s:s + self.seq_len]
+
+    def anchor(self, i: int) -> float:
+        """Mid-price just before window i, for decoding it back to prices."""
+        return float(self.prev_mid[int(self.starts[i])])
+
+    def window_time(self, i: int) -> torch.Tensor:
+        """Timestamps (seconds after midnight) of the rows in window i."""
+        s = int(self.starts[i])
+        return self.time[s:s + self.seq_len]
+
+
+@dataclass
+class LOBSplits:
+    """Everything train.py and predict.py need from the data side."""
+
+    train: LOBWindowDataset
+    val: LOBWindowDataset
+    test: LOBWindowDataset
+    scaler: FeatureScaler
+    feature_names: list[str]
+    config: dict
+
+
+def build_datasets(
+    data_dir: str | Path,
+    seq_len: int = 64,
+    representation: str = "structured",
+    event_stride: int = 10,
+    scaling: str = "minmax",
+    open_minutes: float = 10,
+    close_minutes: float = 10,
+    train_end: str = "14:00",
+    val_end: str = "15:00",
+    train_stride: int = 1,
+    eval_stride: int | None = None,
+) -> LOBSplits:
+    """Run the full pipeline: load, trim, subsample, encode, split, scale, window.
+
+    Features are encoded over the whole trimmed session before splitting. Each
+    feature only looks back one step, so the first validation row's return uses
+    the last training mid-price, which is past information, not look-ahead.
+    The scaler sees training rows only. Evaluation windows default to
+    non-overlapping (eval_stride = seq_len) so each one is a distinct sample.
+    """
+    config = dict(locals())
+    config["data_dir"] = str(data_dir)
+    config["eval_stride"] = eval_stride = eval_stride or seq_len
+
+    book = subsample_events(trim_session(load_lobster(data_dir), open_minutes, close_minutes), event_stride)
+    features = encode_book(book, representation)
+    prev_mid = book.mid[:-1]
+    time = book.time[1:]
+    parts = split_by_time(time, train_end, val_end)
+
+    scaler = FeatureScaler(scaling).fit(features[parts["train"]])
+    scaled = scaler.transform(features)
+
+    def window(name: str, stride: int) -> LOBWindowDataset:
+        s = parts[name]
+        return LOBWindowDataset(scaled[s], prev_mid[s], time[s], seq_len, stride)
+
+    return LOBSplits(
+        train=window("train", train_stride),
+        val=window("val", eval_stride),
+        test=window("test", eval_stride),
+        scaler=scaler,
+        feature_names=feature_names(representation, book.levels),
+        config=config,
+    )
+
+
+def _self_check(data_dir: str, seq_len: int) -> None:
+    """Rebuild the pipeline and assert its leakage and round-trip guarantees."""
+    for representation in REPRESENTATIONS:
+        splits = build_datasets(data_dir, seq_len=seq_len, representation=representation)
+        print(f"\n[{representation}] {len(splits.feature_names)} features, config {splits.config}")
+
+        for name in ("train", "val", "test"):
+            ds = getattr(splits, name)
+            t = ds.time
+            outside = int(((ds.features < 0) | (ds.features > 1)).sum())
+            print(f"  {name:5s} rows {len(ds.features):6d}  windows {len(ds):6d}  "
+                  f"{t[0] / 3600:6.3f}h to {t[-1] / 3600:6.3f}h  "
+                  f"values outside train range: {outside} of {ds.features.numel()}")
+        assert splits.train.time[-1] < splits.val.time[0] < splits.val.time[-1] < splits.test.time[0]
+        assert splits.train[0].shape == (seq_len, len(splits.feature_names))
+
+        # A scaled real window must decode back to a valid book on the tick grid.
+        ds = splits.test
+        decoded = decode_book(splits.scaler.inverse_transform(ds[0]), ds.anchor(0), representation)
+        assert bool((decoded.ask_price[:, 0] > decoded.bid_price[:, 0]).all()), "real window decoded crossed"
+        assert bool((decoded.ask_price.diff(dim=1) > 0).all() and (decoded.bid_price.diff(dim=1) < 0).all())
+        print(f"  first test window decodes to a valid book, best bid/ask "
+              f"{decoded.bid_price[0, 0]:.2f}/{decoded.ask_price[0, 0]:.2f}")
+    print("\nAll checks passed.")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build the LOBSTER datasets and run sanity checks.")
+    parser.add_argument("--data-dir", required=True, help="Folder holding the LOBSTER message and orderbook CSVs")
+    parser.add_argument("--seq-len", type=int, default=64)
+    args = parser.parse_args()
+    _self_check(args.data_dir, args.seq_len)
