@@ -1,0 +1,15 @@
+# Datasets and trained weights never go into the repository
+data/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.csv
+*.npz
+*.npy
+*.zip
+
+# Python cache
+__pycache__/
+*.pyc
