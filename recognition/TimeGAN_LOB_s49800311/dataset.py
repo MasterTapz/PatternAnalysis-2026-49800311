@@ -161,3 +161,123 @@ def split_by_time(time: torch.Tensor, train_end: str = "14:00", val_end: str = "
         "val": slice(i_train, i_val),
         "test": slice(i_val, len(time)),
     }
+
+
+# ---------------------------------------------------------------------------
+# Feature encoding
+#
+# Two encodings of a book snapshot are supported, because the open research
+# question is whether TimeGAN learns the order book constraints by itself:
+#
+#   "structured"  [mid log-return, log spread ticks, log ask gaps (L-1),
+#                  log bid gaps (L-1), log1p ask sizes (L), log1p bid sizes (L)]
+#                 A positive spread and monotonic ladder are built into the
+#                 parametrisation; after tick rounding a spread or gap can
+#                 still collapse to zero, which the audit reports as a locked
+#                 book or a repeated level.
+#   "raw"         [mid log-return, ask offsets from mid in ticks (L),
+#                  bid offsets from mid in ticks (L), log1p sizes (2L)]
+#                 Nothing prevents crossed books or broken ladders, so any
+#                 validity the model shows here was learned.
+#
+# Row j of the features describes book row j + 1; book row 0 only anchors the
+# first return, so its mid-price is passed back in when decoding.
+# ---------------------------------------------------------------------------
+
+REPRESENTATIONS = ("structured", "raw")
+
+
+def feature_names(representation: str = "structured", levels: int = 10) -> list[str]:
+    """Human-readable name of every feature column, in order."""
+    if representation == "structured":
+        prices = ["log_spread_ticks"]
+        prices += [f"log_ask_gap_{k}_{k + 1}" for k in range(1, levels)]
+        prices += [f"log_bid_gap_{k}_{k + 1}" for k in range(1, levels)]
+    elif representation == "raw":
+        prices = [f"ask_offset_{k}" for k in range(1, levels + 1)]
+        prices += [f"bid_offset_{k}" for k in range(1, levels + 1)]
+    else:
+        raise ValueError(f"representation must be one of {REPRESENTATIONS}")
+    sizes = [f"log1p_ask_size_{k}" for k in range(1, levels + 1)]
+    sizes += [f"log1p_bid_size_{k}" for k in range(1, levels + 1)]
+    return ["mid_log_return"] + prices + sizes
+
+
+def encode_book(book: OrderBook, representation: str = "structured") -> torch.Tensor:
+    """Encode book rows 1..N-1 as float64 features of shape (N - 1, F)."""
+    mid = book.mid
+    log_return = torch.log(mid[1:]) - torch.log(mid[:-1])
+    ask, bid = book.ask_price[1:], book.bid_price[1:]
+
+    if representation == "structured":
+        # Real prices sit exactly on the tick grid, so rounding only removes
+        # float noise from the division.
+        spread_ticks = torch.round((ask[:, 0] - bid[:, 0]) / TICK)
+        ask_gaps = torch.round((ask[:, 1:] - ask[:, :-1]) / TICK)
+        bid_gaps = torch.round((bid[:, :-1] - bid[:, 1:]) / TICK)
+        prices = torch.cat([torch.log(spread_ticks)[:, None], torch.log(ask_gaps), torch.log(bid_gaps)], dim=1)
+    elif representation == "raw":
+        centre = mid[1:, None]
+        prices = torch.cat([(ask - centre) / TICK, (centre - bid) / TICK], dim=1)
+    else:
+        raise ValueError(f"representation must be one of {REPRESENTATIONS}")
+
+    sizes = torch.log1p(torch.cat([book.ask_size[1:], book.bid_size[1:]], dim=1))
+    return torch.cat([log_return[:, None], prices, sizes], dim=1)
+
+
+def _snap(price: torch.Tensor) -> torch.Tensor:
+    """Round dollar prices to the nearest tick."""
+    return torch.round(price / TICK) * TICK
+
+
+def decode_book(
+    features: torch.Tensor,
+    prev_mid: torch.Tensor | float,
+    representation: str = "structured",
+    levels: int = 10,
+    round_to_tick: bool = True,
+) -> OrderBook:
+    """Invert encode_book for one sequence of shape (T, F).
+
+    prev_mid is the mid-price just before the first row; the mid path is
+    rebuilt by compounding the log-returns from it. No constraint is enforced
+    here: whatever the features imply, including crossed books, negative
+    sizes or repeated levels, is passed through for the audit to count.
+    """
+    f = features.double()
+    if f.dim() != 2 or f.shape[1] != len(feature_names(representation, levels)):
+        raise ValueError("features must have shape (T, F) for the given representation")
+    mid = torch.as_tensor(prev_mid, dtype=torch.float64) * torch.exp(torch.cumsum(f[:, 0], dim=0))
+
+    if representation == "structured":
+        spread_ticks = torch.exp(f[:, 1])
+        ask_gaps = torch.exp(f[:, 2:levels + 1])
+        bid_gaps = torch.exp(f[:, levels + 1:2 * levels])
+        if round_to_tick:
+            spread_ticks, ask_gaps, bid_gaps = (torch.round(x) for x in (spread_ticks, ask_gaps, bid_gaps))
+        best_bid = mid - spread_ticks * TICK / 2
+        if round_to_tick:
+            best_bid = _snap(best_bid)
+        best_ask = best_bid + spread_ticks * TICK
+        zero = torch.zeros_like(mid)[:, None]
+        ask_price = best_ask[:, None] + torch.cat([zero, torch.cumsum(ask_gaps, dim=1)], dim=1) * TICK
+        bid_price = best_bid[:, None] - torch.cat([zero, torch.cumsum(bid_gaps, dim=1)], dim=1) * TICK
+        size_start = 2 * levels
+    elif representation == "raw":
+        ask_price = mid[:, None] + f[:, 1:levels + 1] * TICK
+        bid_price = mid[:, None] - f[:, levels + 1:2 * levels + 1] * TICK
+        if round_to_tick:
+            ask_price, bid_price = _snap(ask_price), _snap(bid_price)
+        size_start = 2 * levels + 1
+    else:
+        raise ValueError(f"representation must be one of {REPRESENTATIONS}")
+
+    sizes = torch.expm1(f[:, size_start:])
+    return OrderBook(
+        time=torch.arange(f.shape[0], dtype=torch.float64),
+        ask_price=ask_price,
+        ask_size=sizes[:, :levels],
+        bid_price=bid_price,
+        bid_size=sizes[:, levels:],
+    )
