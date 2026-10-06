@@ -335,6 +335,117 @@ class Trainer:
         self._mark = (time.time(), self.step)
 
 
+# ---------------------------------------------------------------------------
+# Plots and the final test evaluation
+# ---------------------------------------------------------------------------
+
+def plot_history(history: dict, path: Path, kl_target: float = 0.1) -> None:
+    """Save one figure with the curves of every phase.
+
+    Each phase keeps its own step counter, so each panel has its own x-axis.
+    Validation KL panels show the spec target of 0.1 as a dashed line.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def series(kind: str, phase: str, key: str):
+        rows = [r for r in history[kind] if r["phase"] == phase and key in r]
+        return [r["step"] for r in rows], [r[key] for r in rows]
+
+    panels = [
+        ("Phase 1: reconstruction MSE", "autoencoder", [("train", "recon_mse", "train"), ("val", "val_recon_mse", "validation")], True),
+        ("Phase 2: supervised MSE", "supervisor", [("train", "supervised_mse", "train"), ("val", "val_supervised_mse", "validation")], True),
+        ("Phase 3: generator terms", "joint", [("train", "g_adv", "adversarial"), ("train", "g_adv_e", "adversarial, raw path"),
+                                               ("train", "g_moment", "moment"), ("train", "g_supervised_mse", "supervised MSE")], True),
+        ("Phase 3: discriminator", "joint", [("train", "d_real", "real BCE"), ("train", "d_fake", "fake BCE"),
+                                             ("train", "d_updated", "share of steps updated")], False),
+        ("Phase 3: gradient norms", "joint", [("train", "g_grad_norm", "generator"), ("train", "d_grad_norm", "discriminator")], True),
+        ("Phase 3: autoencoder on validation", "joint", [("train", "e_recon_mse", "train"), ("val", "val_recon_mse", "validation")], True),
+        ("Phase 3: KL to validation hour", "joint", [("val", "val_kl_spread", "spread"), ("val", "val_kl_return", "return")], True),
+        ("Phase 3: invalid books", "joint", [("val", "crossed_rate", "crossed or locked"), ("val", "ladder_rate", "ladder"),
+                                             ("val", "negative_size_rate", "negative size")], False),
+    ]
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8.5))
+    for ax, (title, phase, lines, log_y) in zip(axes.flat, panels):
+        drawn, plotted_values = False, []
+        for kind, key, label in lines:
+            x, y = series(kind, phase, key)
+            if x:
+                ax.plot(x, y, marker="o" if kind == "val" else None, markersize=3, label=label)
+                plotted_values += y
+                drawn = True
+        if "KL" in title:
+            ax.axhline(kl_target, color="grey", linestyle="--", linewidth=1, label="target 0.1")
+        if drawn and log_y and all(v > 0 for v in plotted_values):   # log axis only when every value is positive
+            ax.set_yscale("log")
+        ax.set_title(title if drawn else f"{title} (not run)")
+        ax.set_xlabel("step in phase")
+        if drawn:
+            ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def evaluate_test(run_dir: Path, splits: LOBSplits, args: argparse.Namespace, n_samples: int = 1024) -> dict:
+    """Score the best checkpoint on the held-out test hour (15:00 to 15:50).
+
+    Reports reconstruction error, invalid-book rates, KL of spreads and moves
+    against the test hour and against the training reference, the same KL for
+    real data alone (the floor any generator is judged against), and the cost
+    of sampling.
+    """
+    checkpoint = run_dir / "best.pt" if (run_dir / "best.pt").exists() else run_dir / "last.pt"
+    state = torch.load(checkpoint, map_location=args.device, weights_only=False)
+    model = TimeGAN(TimeGANConfig(**state["model_config"])).to(args.device)
+    model.load_state_dict(state["model"])
+    model.eval()
+
+    evaluator = Evaluator(splits, args.representation, args.device, n_samples, args.seed)
+    test_x, test_anchor = Evaluator._stack(splits.test, range(len(splits.test)))
+    test_books = decode_windows(test_x, splits.scaler, test_anchor, args.representation)
+
+    torch.manual_seed(args.seed + 1)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.time()
+    fake_x = model.sample(n_samples, splits.test.seq_len, args.device)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    sample_seconds = time.time() - start
+    pick = torch.randint(len(test_anchor), (n_samples,), generator=torch.Generator().manual_seed(args.seed))
+    fake = decode_windows(fake_x, splits.scaler, test_anchor[pick], args.representation)
+
+    x = test_x.to(args.device)
+    report = {
+        "checkpoint": checkpoint.name,
+        "checkpoint_phase_step": [PHASES[min(state["phase_index"], 2)], state["step"]],
+        "test_recon_mse": float(torch.mean((model.reconstruct(x) - x) ** 2)),
+        "violations": book_violations(fake),
+        "vs_test_hour": distribution_report(test_books, fake),
+        "vs_training_reference": distribution_report(evaluator.train_books, fake),
+        "real_floor_training_vs_test": distribution_report(test_books, evaluator.train_books),
+        "real_floor_validation_vs_test": distribution_report(test_books, evaluator.val_books),
+        "parameters": model.parameter_counts(),
+        "sampling": {"sequences": n_samples, "seconds": sample_seconds,
+                     "sequences_per_second": n_samples / max(sample_seconds, 1e-9)},
+    }
+    (run_dir / "test_metrics.json").write_text(json.dumps(report, indent=1))
+
+    print(f"\nTest hour evaluation of {checkpoint.name} ({n_samples} synthetic windows vs {len(test_books)} real)")
+    print(f"  invalid books: {report['violations']}")
+    row = "  {:32s} spread KL {:7.3f}   return KL {:7.3f}"
+    for label, key in [("synthetic vs test hour", "vs_test_hour"), ("synthetic vs training reference", "vs_training_reference"),
+                       ("real floor: training vs test", "real_floor_training_vs_test"),
+                       ("real floor: validation vs test", "real_floor_validation_vs_test")]:
+        print(row.format(label, report[key]["kl_spread"], report[key]["kl_return"]))
+    print(f"  sampling: {report['sampling']['sequences_per_second']:.0f} sequences per second")
+    return report
+
+
 def main(argv: list[str] | None = None) -> Path:
     args = parse_args(argv)
     run_dir = Path(args.out_dir) / args.run_name
@@ -357,6 +468,9 @@ def main(argv: list[str] | None = None) -> Path:
     (run_dir / "config.json").write_text(json.dumps({"args": vars(args), "model": asdict(trainer.model.config),
                                                      "data": splits.config}, indent=1))
     trainer.run()
+    plot_history(trainer.history, run_dir / "training_curves.png")
+    print(f"Saved {run_dir / 'training_curves.png'}")
+    evaluate_test(run_dir, splits, args)
     return run_dir
 
 
