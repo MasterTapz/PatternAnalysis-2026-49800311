@@ -50,6 +50,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix = ("_paper" if args.paper_weights and args.model == "timegan" else "")
     suffix += "_std" if args.scaling == "standard" else ""
     suffix += "_mf" if getattr(args, "move_flag", False) else ""
+    suffix += "_ema" if getattr(args, "ema_decay", 0.0) > 0 else ""
     return f"{args.representation}_{variant}{suffix}_s{args.seed}"
 
 

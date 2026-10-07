@@ -34,6 +34,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
 from dataset import LOBSplits, LOBWindowDataset, build_datasets
@@ -77,6 +78,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train.add_argument("--sup-steps", type=int, default=10_000)
     train.add_argument("--joint-steps", type=int, default=10_000)
     train.add_argument("--clip-grad", type=float, default=None, help="Max gradient norm (off by default)")
+    train.add_argument("--ema-decay", type=float, default=0.0,
+                       help="Evaluate and keep an exponential moving average of the weights during the joint "
+                            "phase, e.g. 0.999 (0 = off)")
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -136,6 +140,33 @@ class Trainer:
         self.history = {"train": [], "val": [], "phases": {}}
         self.phase_index, self.step, self.best_score = 0, 0, float("inf")
         self._mark = (time.time(), 0)   # (wall clock, step) where the current timing interval started
+        self.ema: AveragedModel | None = None   # created when the joint phase starts, if --ema-decay > 0
+
+    # -- weight averaging --------------------------------------------------------
+
+    def _start_ema(self) -> None:
+        """Begin an exponential moving average of the weights (Yazici et al., 2019).
+
+        GAN weights keep oscillating, so any single snapshot can be lucky or
+        unlucky. An average with decay d weights recent steps most but smooths
+        over the last roughly 1 / (1 - d) of them. It starts at the joint phase
+        because the autoencoder and supervisor phases move the weights too far
+        to be worth averaging.
+        """
+        decay = getattr(self.args, "ema_decay", 0.0)   # runs from before the option have none
+        if decay > 0 and self.ema is None:
+            self.ema = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn(decay))
+
+    def _eval_model(self, phase: str) -> torch.nn.Module:
+        """The weights to validate and keep: the moving average in the joint phase when enabled."""
+        if phase != "joint" or self.ema is None:
+            return self.model
+        # The averaged copy's GRU weights are not stored in the single block
+        # cuDNN expects, so repack them before running it.
+        for module in self.ema.module.modules():
+            if isinstance(module, torch.nn.RNNBase):
+                module.flatten_parameters()
+        return self.ema.module
 
     def _build_optimisers(self) -> dict[str, torch.optim.Optimizer]:
         """One Adam optimiser per group of networks that a loss trains."""
@@ -162,11 +193,14 @@ class Trainer:
             "phase_index": self.phase_index, "step": self.step, "best_score": self.best_score,
             "history": self.history, **rng_state(),
         })
+        if self.ema is not None:
+            state["ema"] = {"model": self.ema.module.state_dict(), "n_averaged": int(self.ema.n_averaged)}
         torch.save(state, self.run_dir / LAST_CHECKPOINT)
         (self.run_dir / "history.json").write_text(json.dumps(self.history, indent=1))
 
-    def save_best(self, score: float) -> None:
-        state = run_state(self.model, self.splits, self.args)
+    def save_best(self, score: float, model: torch.nn.Module) -> None:
+        """Write best.pt with the given weights (the moving average when it is enabled)."""
+        state = run_state(model, self.splits, self.args)
         state.update({"phase_index": self.phase_index, "step": self.step, "score": score})
         torch.save(state, self.run_dir / BEST_CHECKPOINT)
 
@@ -178,6 +212,10 @@ class Trainer:
             o.load_state_dict(state["optimisers"][k])
         self.phase_index, self.step, self.best_score = state["phase_index"], state["step"], state["best_score"]
         self.history = state["history"]
+        if "ema" in state:
+            self._start_ema()
+            self.ema.module.load_state_dict(state["ema"]["model"])
+            self.ema.n_averaged.fill_(state["ema"]["n_averaged"])
         restore_rng_state(state)
         if self.phase_index >= len(PHASES):   # every phase already finished: only plots and the test evaluation rerun
             print(f"Resumed {self.run_dir.name}: training already complete")
@@ -277,9 +315,13 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats()
         start, first, window = time.time(), self.step, []
         self._mark = (time.time(), self.step)
+        if phase == "joint":
+            self._start_ema()
         self.model.train()
         while self.step < total:
             window.append(step_fn())
+            if phase == "joint" and self.ema is not None:
+                self.ema.update_parameters(self.model)
             self.step += 1
             if self.step % self.args.log_every == 0 or self.step == total:
                 self._log_train(phase, window)
@@ -306,13 +348,14 @@ class Trainer:
 
     def _evaluate(self, phase: str) -> None:
         """Score on the validation hour, keep best.pt in the joint phase, then save last.pt."""
-        self.model.eval()
-        metrics = self.evaluator.reconstruction(self.model)
+        model = self._eval_model(phase)
+        model.eval()
+        metrics = self.evaluator.reconstruction(model)
         if phase == "joint":
-            metrics.update(self.evaluator.samples(self.model))
+            metrics.update(self.evaluator.samples(model))
             if metrics["score"] < self.best_score:
                 self.best_score = metrics["score"]
-                self.save_best(metrics["score"])
+                self.save_best(metrics["score"], model)
                 metrics["new_best"] = 1.0
         self._log_val(phase, metrics)
         self.model.train()
