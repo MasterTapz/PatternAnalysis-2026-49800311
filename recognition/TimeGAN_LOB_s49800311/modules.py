@@ -490,6 +490,125 @@ class TimeGAN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Baseline: a plain recurrent GAN in feature space
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RecurrentGANConfig:
+    """Settings for the baseline recurrent GAN.
+
+    The baseline is the standard recurrent GAN design that TimeGAN builds on
+    (in the spirit of C-RNN-GAN, Mogren 2016, and RCGAN, Esteban et al. 2017):
+    a recurrent generator writes feature sequences directly from noise and a
+    recurrent discriminator scores them, trained only with the adversarial
+    loss. It has no embedder, no recovery, no latent space and no supervised
+    or moment loss, so comparing it with TimeGAN measures what those
+    additions buy. moment_weight > 0 adds TimeGAN's moment loss as an option
+    for a fairer variant; by default the moment loss is only logged.
+    """
+
+    feature_dim: int
+    hidden_dim: int = 64
+    num_layers: int = 3
+    rnn_type: str = "gru"
+    z_dim: int | None = None
+    output_activation: str = "sigmoid"
+    moment_weight: float = 0.0
+
+    def __post_init__(self):
+        if self.z_dim is None:
+            self.z_dim = self.feature_dim
+        if self.output_activation not in ACTIVATIONS:
+            raise ValueError(f"output_activation must be one of {ACTIVATIONS}")
+        if self.rnn_type not in RNN_TYPES:
+            raise ValueError(f"rnn_type must be one of {tuple(RNN_TYPES)}")
+
+
+class RecurrentGAN(nn.Module):
+    """Baseline generator: noise (B, T, Z) -> features (B, T, F), judged in feature space.
+
+    Exposes the same interface the trainer and predict.py use for TimeGAN:
+    noise, generate, sample, generator_loss, discriminator_loss,
+    should_update_discriminator, *_parameters, networks and parameter_counts.
+    """
+
+    def __init__(self, config: RecurrentGANConfig):
+        super().__init__()
+        self.config = c = config
+        self.generator = RecurrentBlock(c.z_dim, c.hidden_dim, c.feature_dim, c.num_layers, c.rnn_type,
+                                        c.output_activation)
+        self.discriminator = RecurrentBlock(c.feature_dim, c.hidden_dim, 1, c.num_layers, c.rnn_type, "identity")
+
+    def networks(self) -> dict[str, nn.Module]:
+        return {"generator": self.generator, "discriminator": self.discriminator}
+
+    def parameter_counts(self) -> dict[str, int]:
+        counts = {name: count_parameters(net) for name, net in self.networks().items()}
+        counts["total"] = count_parameters(self)
+        return counts
+
+    def generator_parameters(self) -> list[nn.Parameter]:
+        return list(self.generator.parameters())
+
+    def discriminator_parameters(self) -> list[nn.Parameter]:
+        return list(self.discriminator.parameters())
+
+    def _device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def noise(self, n: int, seq_len: int, device: torch.device | str | None = None) -> torch.Tensor:
+        """Uniform noise on [0, 1), the same prior TimeGAN uses."""
+        return torch.rand(n, seq_len, self.config.z_dim, device=device or self._device())
+
+    def generate(self, z: torch.Tensor) -> torch.Tensor:
+        return self.generator(z)
+
+    forward = generate
+
+    @torch.no_grad()
+    def sample(self, n: int, seq_len: int, device: torch.device | str | None = None,
+               batch_size: int = 1024) -> torch.Tensor:
+        """Draw n synthetic sequences (n, seq_len, F) in the scaled feature space."""
+        device = device or self._device()
+        chunks = [self.generate(self.noise(min(batch_size, n - i), seq_len, device))
+                  for i in range(0, n, batch_size)]
+        return torch.cat(chunks, dim=0)
+
+    def generator_loss(self, x: torch.Tensor, z: torch.Tensor | None = None):
+        """Non-saturating adversarial loss for the generator, discriminator frozen.
+
+        x: (B, T, F) real windows, used only for the logged (or optional) moment loss.
+        Logs: adv, moment, total.
+        """
+        if z is None:
+            z = self.noise(x.shape[0], x.shape[1], x.device)
+        with frozen(self.discriminator):
+            x_hat = self.generator(z)
+            adv = adversarial_bce(self.discriminator(x_hat), real=True)
+        moments = moment_loss(x_hat, x)
+        loss = adv + self.config.moment_weight * moments if self.config.moment_weight > 0 else adv
+        return loss, {"adv": adv.detach(), "moment": moments.detach(), "total": loss.detach()}
+
+    def discriminator_loss(self, x: torch.Tensor, z: torch.Tensor | None = None):
+        """BCE on real windows and on generated windows computed without gradients.
+
+        Logs: real, fake, total.
+        """
+        if z is None:
+            z = self.noise(x.shape[0], x.shape[1], x.device)
+        with torch.no_grad():
+            x_hat = self.generator(z)
+        real = adversarial_bce(self.discriminator(x), real=True)
+        fake = adversarial_bce(self.discriminator(x_hat), real=False)
+        loss = real + fake
+        return loss, {"real": real.detach(), "fake": fake.detach(), "total": loss.detach()}
+
+    def should_update_discriminator(self, d_loss: torch.Tensor | float) -> bool:
+        """The baseline always updates its discriminator (no skip rule)."""
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: python modules.py [--data-dir ../../../../data/LOBSTER]
 # ---------------------------------------------------------------------------
 
@@ -565,6 +684,27 @@ def _check_model(x: torch.Tensor, config: TimeGANConfig, label: str) -> None:
         print(f"  peak CUDA memory        {torch.cuda.max_memory_allocated(device) / 2**20:.1f} MiB")
 
 
+def _check_baseline(x: torch.Tensor, config: RecurrentGANConfig) -> None:
+    """Both baseline losses run, train only their own network, and sampling works."""
+    model = RecurrentGAN(config).to(x.device).train()
+    print(f"\n[baseline recurrent GAN] parameters: {model.parameter_counts()}")
+    for phase, loss_fn, trained in [("generator", lambda: model.generator_loss(x), {"generator"}),
+                                    ("discriminator", lambda: model.discriminator_loss(x), {"discriminator"})]:
+        model.zero_grad(set_to_none=True)
+        loss, logs = loss_fn()
+        assert loss.dim() == 0 and bool(torch.isfinite(loss)), f"baseline {phase}: loss is not a finite scalar"
+        loss.backward()
+        for name, net in model.networks().items():
+            has_grad = [p.grad is not None for p in net.parameters()]
+            assert all(has_grad) if name in trained else not any(has_grad), f"baseline {phase}: wrong gradients on {name}"
+        assert all(p.requires_grad for p in model.parameters()), f"baseline {phase}: a frozen flag was not restored"
+        print(f"  {phase:23s} " + "  ".join(f"{k} {float(v):.4f}" for k, v in logs.items()))
+    samples = model.sample(512, x.shape[1], x.device, batch_size=200)
+    assert samples.shape == (512, x.shape[1], x.shape[2]) and bool(torch.isfinite(samples).all())
+    print(f"  sample                  shape {tuple(samples.shape)}  range [{float(samples.min()):.3f}, "
+          f"{float(samples.max()):.3f}]")
+
+
 def _overfit_autoencoder(x: torch.Tensor, config: TimeGANConfig, steps: int) -> None:
     """Phase 1 on a single batch: reconstruction must beat predicting each feature's mean.
 
@@ -621,6 +761,7 @@ if __name__ == "__main__":
                 rnn_type=args.rnn_type)
     _check_model(batch, TimeGANConfig(**base), "TimeGAN")
     _check_model(batch, TimeGANConfig(**base, use_supervisor=False), "ablation: no supervisor")
+    _check_baseline(batch, RecurrentGANConfig(**base))
     if args.overfit_steps > 0:
         _overfit_autoencoder(batch, TimeGANConfig(**base), args.overfit_steps)
     print("\nAll checks passed.")
