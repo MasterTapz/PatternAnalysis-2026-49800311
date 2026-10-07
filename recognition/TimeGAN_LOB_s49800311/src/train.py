@@ -67,6 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="Optional moment loss weight for the rgan baseline (0 = pure adversarial)")
     model.add_argument("--hidden-dim", type=int, default=64)
     model.add_argument("--num-layers", type=int, default=3)
+    model.add_argument("--static-noise-dim", type=int, default=0,
+                       help="TimeGAN only: noise channels held constant over each window, e.g. 8 (0 = paper)")
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
     model.add_argument("--paper-weights", action="store_true",
                        help="Loss weights as written in the paper instead of the authors' code")

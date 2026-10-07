@@ -36,7 +36,7 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """<representation>_<variant>[_paper][_std][_mf]_s<seed>, unique for every setting that changes results.
+    """<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>]_s<seed>, unique for every setting that changes results.
 
     variant is timegan, nosup (no supervisor), rgan (plain baseline) or rganm
     (baseline with the moment loss). _paper marks the paper's loss weights,
@@ -51,6 +51,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix += "_std" if args.scaling == "standard" else ""
     suffix += "_mf" if getattr(args, "move_flag", False) else ""
     suffix += "_ema" if getattr(args, "ema_decay", 0.0) > 0 else ""
+    suffix += f"_sn{args.static_noise_dim}" if getattr(args, "static_noise_dim", 0) > 0 and args.model == "timegan" else ""
     return f"{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
@@ -68,6 +69,7 @@ def build_model(args: argparse.Namespace, feature_dim: int) -> SequenceGAN:
         num_layers=args.num_layers,
         recovery_activation=activation,
         use_supervisor=not args.no_supervisor,
+        static_noise_dim=getattr(args, "static_noise_dim", 0),   # runs from before the option have none
         **extra,
     ))
 

@@ -243,8 +243,20 @@ class SequenceGAN(nn.Module):
         return next(self.parameters()).device
 
     def noise(self, n: int, seq_len: int, device: torch.device | str | None = None) -> torch.Tensor:
-        """Noise z of shape (n, seq_len, Z), i.i.d. uniform on [0, 1) as in the paper (same prior for both models)."""
-        return torch.rand(n, seq_len, self.config.z_dim, device=device or self._device())
+        """Noise z of shape (n, seq_len, Z + S), uniform on [0, 1) as in the paper (same prior for both models).
+
+        The first Z channels are drawn fresh at every step. The last S
+        channels (config.static_noise_dim, 0 by default) are drawn once per
+        sequence and repeated over time, so a whole window can share a regime
+        such as a wide or narrow spread instead of redrawing it every step.
+        """
+        device = device or self._device()
+        z = torch.rand(n, seq_len, self.config.z_dim, device=device)
+        static_dim = getattr(self.config, "static_noise_dim", 0)
+        if static_dim == 0:
+            return z
+        static = torch.rand(n, 1, static_dim, device=device).expand(n, seq_len, static_dim)
+        return torch.cat([z, static], dim=2)
 
     @torch.no_grad()
     def sample(self, n: int, seq_len: int, device: torch.device | str | None = None,
@@ -294,6 +306,9 @@ class TimeGANConfig:
 
     d_threshold: the authors' code skips the discriminator update whenever its
     loss is already below 0.15, so it cannot overpower the generator.
+
+    static_noise_dim: extra noise channels held constant over each sequence
+    (see SequenceGAN.noise). 0 reproduces the paper's per-step noise only.
     """
 
     feature_dim: int
@@ -301,6 +316,7 @@ class TimeGANConfig:
     num_layers: int = 3
     rnn_type: str = "gru"
     z_dim: int | None = None
+    static_noise_dim: int = 0
     recovery_activation: str = "sigmoid"
     bidirectional_discriminator: bool = False
     use_supervisor: bool = True
@@ -342,7 +358,7 @@ class TimeGAN(SequenceGAN):
         self.config = c = config
         self.embedder = Embedder(c.feature_dim, c.hidden_dim, c.num_layers, c.rnn_type)
         self.recovery = Recovery(c.feature_dim, c.hidden_dim, c.num_layers, c.rnn_type, c.recovery_activation)
-        self.generator = Generator(c.z_dim, c.hidden_dim, c.num_layers, c.rnn_type)
+        self.generator = Generator(c.z_dim + c.static_noise_dim, c.hidden_dim, c.num_layers, c.rnn_type)
         self.supervisor = Supervisor(c.hidden_dim, c.num_layers, c.rnn_type) if c.use_supervisor else None
         self.discriminator = Discriminator(c.hidden_dim, c.num_layers, c.rnn_type, c.bidirectional_discriminator)
 
