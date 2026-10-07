@@ -179,7 +179,10 @@ class Trainer:
         self.phase_index, self.step, self.best_score = state["phase_index"], state["step"], state["best_score"]
         self.history = state["history"]
         restore_rng_state(state)
-        print(f"Resumed {self.run_dir.name} at phase {PHASES[self.phase_index]}, step {self.step}")
+        if self.phase_index >= len(PHASES):   # every phase already finished: only plots and the test evaluation rerun
+            print(f"Resumed {self.run_dir.name}: training already complete")
+        else:
+            print(f"Resumed {self.run_dir.name} at phase {PHASES[self.phase_index]}, step {self.step}")
 
     # -- logging ---------------------------------------------------------------
 
