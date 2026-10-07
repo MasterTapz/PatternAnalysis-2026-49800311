@@ -1,28 +1,23 @@
-"""Train TimeGAN on LOBSTER order book windows.
+"""Train TimeGAN, its no-supervisor ablation or the baseline on LOBSTER windows.
 
-Runs the three training phases of Yoon et al. (2019):
-  1. autoencoder  embedder and recovery learn a latent space for real windows
+TimeGAN trains in three phases (Yoon et al., 2019):
+  1. autoencoder  embedder and recovery learn a latent space
   2. supervisor   the supervisor learns to predict the next latent step
-  3. joint        generator, supervisor, embedder, recovery and discriminator
-                  train together, two generator updates per discriminator one
-The no-supervisor ablation (--no-supervisor) skips phase 2 and drops every
-supervised term, so comparing the two runs isolates what that loss adds.
-The baseline (--model rgan) is a plain recurrent GAN in feature space; it
-skips phases 1 and 2 and trains in the joint phase with one generator and
-one discriminator update per step.
+  3. joint        all five networks train together, two generator updates
+                  per discriminator update
+--no-supervisor skips phase 2 and every supervised loss term. The baseline
+(--model rgan) only has phase 3, with one update of each network per step.
 
-Validation uses the 14:00 to 15:00 hour only. During phase 3, generated
-samples are decoded back into order books and scored against the validation
-hour and against a reference set of training windows; the checkpoint with the
-lowest validation score is kept as best.pt. The test hour is only used once,
-after training, to score best.pt.
+During phase 3 the samples are scored against the validation hour
+(14:00 to 15:00) and the best checkpoint is kept as best.pt. The test hour
+is only used once, after training, to score best.pt.
 
-Examples (from the project folder, the one holding src/):
+Examples (from the folder holding src/):
   python src/train.py --data-dir ../../../../data/LOBSTER
+  python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8
   python src/train.py --data-dir ../../../../data/LOBSTER --no-supervisor
-  python src/train.py --data-dir ../../../../data/LOBSTER --model rgan
-  python src/train.py --data-dir ../../../../data/LOBSTER --representation raw
-  python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_s0 --resume
+  python src/train.py --data-dir ../../../../data/LOBSTER --model rgan --baseline-moment-weight 100
+  python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_timegan_s0 --resume
 """
 from __future__ import annotations
 
@@ -57,21 +52,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--scaling", choices=("minmax", "standard"), default="minmax")
     data.add_argument("--seq-len", type=int, default=64)
     data.add_argument("--event-stride", type=int, default=10)
-    data.add_argument("--move-flag", action="store_true",
-                      help="Add a binary mid-moved feature so zero price moves can be generated")
+    data.add_argument("--move-flag", action="store_true", help="Add a binary mid-moved feature")
 
     model = p.add_argument_group("model")
-    model.add_argument("--model", choices=tuple(MODELS), default="timegan",
-                       help="timegan, or rgan for the baseline recurrent GAN (one adversarial phase only)")
+    model.add_argument("--model", choices=tuple(MODELS), default="timegan", help="timegan, or rgan for the baseline")
     model.add_argument("--baseline-moment-weight", type=float, default=0.0,
-                       help="Optional moment loss weight for the rgan baseline (0 = pure adversarial)")
+                       help="Moment loss weight for the baseline (0 = adversarial loss only)")
     model.add_argument("--hidden-dim", type=int, default=64)
     model.add_argument("--num-layers", type=int, default=3)
     model.add_argument("--static-noise-dim", type=int, default=0,
-                       help="TimeGAN only: noise channels held constant over each window, e.g. 8 (0 = paper)")
+                       help="TimeGAN noise channels held constant over each window, e.g. 8")
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
     model.add_argument("--paper-weights", action="store_true",
-                       help="Loss weights as written in the paper instead of the authors' code")
+                       help="Loss weights from the paper instead of the authors' code")
 
     train = p.add_argument_group("training")
     train.add_argument("--batch-size", type=int, default=128)
@@ -81,18 +74,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train.add_argument("--joint-steps", type=int, default=10_000)
     train.add_argument("--clip-grad", type=float, default=None, help="Max gradient norm (off by default)")
     train.add_argument("--ema-decay", type=float, default=0.0,
-                       help="Evaluate and keep an exponential moving average of the weights during the joint "
-                            "phase, e.g. 0.999 (0 = off)")
+                       help="Keep a moving average of the weights in the joint phase, e.g. 0.999 (0 = off)")
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     run = p.add_argument_group("logging and checkpoints")
     run.add_argument("--out-dir", default="runs")
-    run.add_argument("--run-name", default=None, help="Defaults to <representation>_<variant>_s<seed>")
+    run.add_argument("--run-name", default=None, help="Defaults to a name built from the options and seed")
     run.add_argument("--log-every", type=int, default=100)
     run.add_argument("--eval-every", type=int, default=500)
     run.add_argument("--eval-samples", type=int, default=512)
     run.add_argument("--resume", action="store_true", help="Continue from <run>/last.pt")
+
     args = p.parse_args(argv)
     if args.model == "rgan" and args.no_supervisor:
         p.error("--no-supervisor only applies to --model timegan")
@@ -102,11 +95,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def batches(dataset: LOBWindowDataset, batch_size: int, seed: int, device: str) -> Iterator[torch.Tensor]:
-    """Endless stream of shuffled training batches on the target device.
-
-    Shuffling only changes which training windows share a batch; every window
-    still comes from the training hours and keeps its internal time order.
-    """
+    """Endless shuffled training batches. Shuffling never reorders steps inside a window."""
     generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=generator)
     while True:
@@ -115,12 +104,11 @@ def batches(dataset: LOBWindowDataset, batch_size: int, seed: int, device: str) 
 
 
 def grad_norm(params: list[torch.nn.Parameter], clip: float | None) -> float:
-    """Total gradient norm before clipping; clips in place when clip is set."""
+    """Gradient norm before clipping; clips in place when clip is set."""
     return float(torch.nn.utils.clip_grad_norm_(params, clip if clip is not None else float("inf")))
 
 
 def as_floats(logs: dict[str, torch.Tensor], prefix: str = "") -> dict[str, float]:
-    """Detached loss components as plain floats for the history, keys optionally prefixed."""
     return {f"{prefix}{k}": float(v) for k, v in logs.items()}
 
 
@@ -129,7 +117,7 @@ def as_floats(logs: dict[str, torch.Tensor], prefix: str = "") -> dict[str, floa
 # ---------------------------------------------------------------------------
 
 class Trainer:
-    """Owns the model, optimisers, history and checkpoints for one run."""
+    """Model, optimisers, history and checkpoints of one run."""
 
     def __init__(self, args: argparse.Namespace, splits: LOBSplits, run_dir: Path):
         self.args, self.splits, self.run_dir = args, splits, run_dir
@@ -141,37 +129,11 @@ class Trainer:
         self.data = batches(splits.train, args.batch_size, args.seed, self.device)
         self.history = {"train": [], "val": [], "phases": {}}
         self.phase_index, self.step, self.best_score = 0, 0, float("inf")
-        self._mark = (time.time(), 0)   # (wall clock, step) where the current timing interval started
-        self.ema: AveragedModel | None = None   # created when the joint phase starts, if --ema-decay > 0
-
-    # -- weight averaging --------------------------------------------------------
-
-    def _start_ema(self) -> None:
-        """Begin an exponential moving average of the weights (Yazici et al., 2019).
-
-        GAN weights keep oscillating, so any single snapshot can be lucky or
-        unlucky. An average with decay d weights recent steps most but smooths
-        over the last roughly 1 / (1 - d) of them. It starts at the joint phase
-        because the autoencoder and supervisor phases move the weights too far
-        to be worth averaging.
-        """
-        decay = getattr(self.args, "ema_decay", 0.0)   # runs from before the option have none
-        if decay > 0 and self.ema is None:
-            self.ema = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn(decay))
-
-    def _eval_model(self, phase: str) -> torch.nn.Module:
-        """The weights to validate and keep: the moving average in the joint phase when enabled."""
-        if phase != "joint" or self.ema is None:
-            return self.model
-        # The averaged copy's GRU weights are not stored in the single block
-        # cuDNN expects, so repack them before running it.
-        for module in self.ema.module.modules():
-            if isinstance(module, torch.nn.RNNBase):
-                module.flatten_parameters()
-        return self.ema.module
+        self._mark = (time.time(), 0)            # wall clock and step where the current timing interval began
+        self.ema: AveragedModel | None = None    # created at the start of the joint phase
 
     def _build_optimisers(self) -> dict[str, torch.optim.Optimizer]:
-        """One Adam optimiser per group of networks that a loss trains."""
+        """One Adam optimiser per group of networks trained by the same loss."""
         def adam(params: list[torch.nn.Parameter]) -> torch.optim.Optimizer:
             return torch.optim.Adam(params, lr=self.args.lr)
 
@@ -185,15 +147,35 @@ class Trainer:
                 optimisers["supervisor"] = adam(self.model.supervisor_parameters())
         return optimisers
 
-    # -- checkpoints -----------------------------------------------------------
+    # -- weight averaging ----------------------------------------------------
+
+    def _start_ema(self) -> None:
+        """Start an exponential moving average of the weights (Yazici et al., 2019)."""
+        if self.args.ema_decay > 0 and self.ema is None:
+            self.ema = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn(self.args.ema_decay))
+
+    def _eval_model(self, phase: str) -> torch.nn.Module:
+        """The weights to validate and keep: the moving average in the joint phase, if enabled."""
+        if phase != "joint" or self.ema is None:
+            return self.model
+        # The averaged copy's GRU weights are not in the single block cuDNN expects.
+        for module in self.ema.module.modules():
+            if isinstance(module, torch.nn.RNNBase):
+                module.flatten_parameters()
+        return self.ema.module
+
+    # -- checkpoints ---------------------------------------------------------
 
     def save(self) -> None:
-        """Write last.pt (everything --resume needs) and history.json."""
+        """Write last.pt and history.json."""
         state = run_state(self.model, self.splits, self.args)
         state.update({
             "optimisers": {k: o.state_dict() for k, o in self.optimisers.items()},
-            "phase_index": self.phase_index, "step": self.step, "best_score": self.best_score,
-            "history": self.history, **rng_state(),
+            "phase_index": self.phase_index,
+            "step": self.step,
+            "best_score": self.best_score,
+            "history": self.history,
+            **rng_state(),
         })
         if self.ema is not None:
             state["ema"] = {"model": self.ema.module.state_dict(), "n_averaged": int(self.ema.n_averaged)}
@@ -201,13 +183,12 @@ class Trainer:
         (self.run_dir / "history.json").write_text(json.dumps(self.history, indent=1))
 
     def save_best(self, score: float, model: torch.nn.Module) -> None:
-        """Write best.pt with the given weights (the moving average when it is enabled)."""
         state = run_state(model, self.splits, self.args)
         state.update({"phase_index": self.phase_index, "step": self.step, "score": score})
         torch.save(state, self.run_dir / BEST_CHECKPOINT)
 
     def load(self) -> None:
-        """Restore model, optimisers, progress, history and random states from last.pt."""
+        """Restore everything from last.pt."""
         state = load_checkpoint(self.run_dir / LAST_CHECKPOINT, self.device)
         self.model.load_state_dict(state["model"])
         for k, o in self.optimisers.items():
@@ -219,12 +200,12 @@ class Trainer:
             self.ema.module.load_state_dict(state["ema"]["model"])
             self.ema.n_averaged.fill_(state["ema"]["n_averaged"])
         restore_rng_state(state)
-        if self.phase_index >= len(PHASES):   # every phase already finished: only plots and the test evaluation rerun
+        if self.phase_index >= len(PHASES):
             print(f"Resumed {self.run_dir.name}: training already complete")
         else:
             print(f"Resumed {self.run_dir.name} at phase {PHASES[self.phase_index]}, step {self.step}")
 
-    # -- logging ---------------------------------------------------------------
+    # -- logging -------------------------------------------------------------
 
     def _log_train(self, phase: str, window: list[dict]) -> None:
         mean = {k: sum(d[k] for d in window) / len(window) for k in window[0]}
@@ -235,10 +216,10 @@ class Trainer:
         shown = {k: round(v, 4) for k, v in metrics.items() if not k.endswith("reverse")}
         print(f"  [{phase} {self.step:6d}] {shown}", flush=True)
 
-    # -- one optimisation step per phase ---------------------------------------
+    # -- optimisation steps --------------------------------------------------
 
     def _update(self, name: str, loss: torch.Tensor) -> float:
-        """Backpropagate loss and step optimiser name; returns the gradient norm before clipping."""
+        """Backpropagate and step one optimiser; returns the gradient norm before clipping."""
         opt = self.optimisers[name]
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -262,7 +243,7 @@ class Trainer:
     def _timegan_joint_step(self) -> dict:
         """Two generator and embedder updates, then one discriminator update unless its loss is already low."""
         out: dict[str, float] = {}
-        for _ in range(2):   # two generator and embedder updates per discriminator update, as in the authors' code
+        for _ in range(2):
             x = next(self.data)
             g_loss, g_logs = self.model.generator_loss(x)
             out["g_grad_norm"] = self._update("generator", g_loss)
@@ -275,7 +256,6 @@ class Trainer:
         return {**out, **as_floats(g_logs, "g_"), **as_floats(e_logs, "e_"), **as_floats(d_logs, "d_")}
 
     def _baseline_step(self) -> dict:
-        """One generator and one discriminator update for the baseline recurrent GAN."""
         g_loss, g_logs = self.model.generator_loss(next(self.data))
         out = {"g_grad_norm": self._update("generator", g_loss)}
         d_loss, d_logs = self.model.discriminator_loss(next(self.data))
@@ -283,12 +263,14 @@ class Trainer:
         out["d_updated"] = 1.0
         return {**out, **as_floats(g_logs, "g_"), **as_floats(d_logs, "d_")}
 
-    # -- phase driver ------------------------------------------------------------
+    # -- phases --------------------------------------------------------------
 
     def run(self) -> None:
-        """Run the remaining phases in order, saving last.pt after each one."""
-        steps = {"autoencoder": self.args.ae_steps, "supervisor": self.args.sup_steps, "joint": self.args.joint_steps}
-        step_fns = {"autoencoder": self._autoencoder_step, "supervisor": self._supervisor_step, "joint": self._joint_step}
+        """Run the remaining phases in order, saving last.pt after each."""
+        steps = {"autoencoder": self.args.ae_steps, "supervisor": self.args.sup_steps,
+                 "joint": self.args.joint_steps}
+        step_fns = {"autoencoder": self._autoencoder_step, "supervisor": self._supervisor_step,
+                    "joint": self._joint_step}
         while self.phase_index < len(PHASES):
             phase = PHASES[self.phase_index]
             reason = self._skip_reason(phase)
@@ -301,7 +283,6 @@ class Trainer:
             self.save()
 
     def _skip_reason(self, phase: str) -> str | None:
-        """Why this model has no such phase, or None when it should run."""
         if not self.is_timegan and phase != "joint":
             return "the baseline only has the adversarial phase"
         if phase == "supervisor" and self.model.supervisor is None:
@@ -334,10 +315,10 @@ class Trainer:
         print(f"Phase {phase} finished: {self.step - first} steps in {time.time() - start:.0f} s", flush=True)
 
     def _account(self, phase: str) -> None:
-        """Add the training time and steps since the last mark to the phase record.
+        """Add the time and steps since the last mark to the phase record.
 
-        Called before every evaluation (and so before every checkpoint), so an
-        interrupted run keeps its timing; evaluation time is not counted.
+        Runs before every evaluation, so an interrupted run keeps its timing.
+        Evaluation time is not counted.
         """
         then, step = self._mark
         record = self.history["phases"].setdefault(phase, {"seconds": 0.0, "steps": 0})
@@ -346,10 +327,11 @@ class Trainer:
         record["steps_per_second"] = record["steps"] / max(record["seconds"], 1e-9)
         record["sequences_per_second"] = record["steps_per_second"] * self.args.batch_size
         if torch.cuda.is_available():
-            record["peak_vram_mib"] = max(record.get("peak_vram_mib", 0.0), torch.cuda.max_memory_allocated() / 2**20)
+            peak = torch.cuda.max_memory_allocated() / 2**20
+            record["peak_vram_mib"] = max(record.get("peak_vram_mib", 0.0), peak)
 
     def _evaluate(self, phase: str) -> None:
-        """Score on the validation hour, keep best.pt in the joint phase, then save last.pt."""
+        """Validate, keep best.pt in the joint phase, then save last.pt."""
         model = self._eval_model(phase)
         model.eval()
         metrics = self.evaluator.reconstruction(model)
@@ -373,22 +355,22 @@ def main(argv: list[str] | None = None) -> Path:
     args = parse_args(argv)
     run_dir = Path(args.out_dir) / args.run_name
     if args.resume:
-        args = resumed_args(run_dir, args.device)
+        args = resumed_args(run_dir, defaults=parse_args(["--data-dir", args.data_dir]), device=args.device)
     elif (run_dir / LAST_CHECKPOINT).exists():
         raise FileExistsError(f"{run_dir} already has a run; pass --resume or choose another --run-name")
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
 
     splits = build_datasets(args.data_dir, seq_len=args.seq_len, representation=args.representation,
-                            event_stride=args.event_stride, scaling=args.scaling,
-                            move_flag=getattr(args, "move_flag", False))   # runs from before the flag have none
+                            event_stride=args.event_stride, scaling=args.scaling, move_flag=args.move_flag)
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()
     print(f"Run {run_dir} on {args.device}: {len(splits.train)} training windows, "
           f"parameters {trainer.model.parameter_counts()}", flush=True)
-    (run_dir / "config.json").write_text(json.dumps({"args": vars(args), "model": asdict(trainer.model.config),
-                                                     "data": splits.config}, indent=1))
+    config = {"args": vars(args), "model": asdict(trainer.model.config), "data": splits.config}
+    (run_dir / "config.json").write_text(json.dumps(config, indent=1))
+
     trainer.run()
     plot_history(trainer.history, run_dir / "training_curves.png")
     print(f"Saved {run_dir / 'training_curves.png'}")
