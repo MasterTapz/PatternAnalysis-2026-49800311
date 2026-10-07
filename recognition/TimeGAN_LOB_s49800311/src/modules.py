@@ -214,6 +214,52 @@ def moment_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Interface shared by TimeGAN and the baseline
+# ---------------------------------------------------------------------------
+
+class SequenceGAN(nn.Module):
+    """Noise, sampling and bookkeeping common to TimeGAN and the baseline recurrent GAN.
+
+    Subclasses define networks() and generate(z) and keep z_dim in
+    self.config. The trainer and predict.py use only this interface plus each
+    model's generator_loss, discriminator_loss and should_update_discriminator,
+    so either model can be trained and audited by the same code.
+    """
+
+    def networks(self) -> dict[str, nn.Module]:
+        raise NotImplementedError
+
+    def generate(self, z: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def parameter_counts(self) -> dict[str, int]:
+        """Parameters per network and in total, for the README resource table."""
+        counts = {name: count_parameters(net) for name, net in self.networks().items()}
+        counts["total"] = count_parameters(self)
+        return counts
+
+    def _device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def noise(self, n: int, seq_len: int, device: torch.device | str | None = None) -> torch.Tensor:
+        """Noise z of shape (n, seq_len, Z), i.i.d. uniform on [0, 1) as in the paper (same prior for both models)."""
+        return torch.rand(n, seq_len, self.config.z_dim, device=device or self._device())
+
+    @torch.no_grad()
+    def sample(self, n: int, seq_len: int, device: torch.device | str | None = None,
+               batch_size: int = 1024) -> torch.Tensor:
+        """Draw n synthetic sequences (n, seq_len, F) in the scaled feature space.
+
+        The output is still scaled; invert it with the training scaler from
+        dataset.py. Generated in chunks of batch_size to bound memory.
+        """
+        device = device or self._device()
+        chunks = [self.generate(self.noise(min(batch_size, n - i), seq_len, device))
+                  for i in range(0, n, batch_size)]
+        return torch.cat(chunks, dim=0)
+
+
+# ---------------------------------------------------------------------------
 # The full model
 # ---------------------------------------------------------------------------
 
@@ -274,7 +320,7 @@ class TimeGANConfig:
             raise ValueError(f"rnn_type must be one of {tuple(RNN_TYPES)}")
 
 
-class TimeGAN(nn.Module):
+class TimeGAN(SequenceGAN):
     """The five TimeGAN networks plus one loss method per training phase.
 
     Training phases (train.py drives them; each loss returns (loss, logs),
@@ -307,12 +353,6 @@ class TimeGAN(nn.Module):
                 "supervisor": self.supervisor, "discriminator": self.discriminator}
         return {name: net for name, net in nets.items() if net is not None}
 
-    def parameter_counts(self) -> dict[str, int]:
-        """Parameters per network and in total, for the README resource table."""
-        counts = {name: count_parameters(net) for name, net in self.networks().items()}
-        counts["total"] = count_parameters(self)
-        return counts
-
     def autoencoder_parameters(self) -> list[nn.Parameter]:
         return [*self.embedder.parameters(), *self.recovery.parameters()]
 
@@ -326,14 +366,7 @@ class TimeGAN(nn.Module):
     def discriminator_parameters(self) -> list[nn.Parameter]:
         return list(self.discriminator.parameters())
 
-    def _device(self) -> torch.device:
-        return next(self.parameters()).device
-
     # -- forward maps ----------------------------------------------------------
-
-    def noise(self, n: int, seq_len: int, device: torch.device | str | None = None) -> torch.Tensor:
-        """Noise z of shape (n, seq_len, Z), i.i.d. uniform on [0, 1) as in the paper."""
-        return torch.rand(n, seq_len, self.config.z_dim, device=device or self._device())
 
     def supervise(self, e: torch.Tensor) -> torch.Tensor:
         """s(e) of shape (B, T, H); the identity in the ablation, which has no supervisor."""
@@ -344,19 +377,6 @@ class TimeGAN(nn.Module):
         return self.recovery(self.supervise(self.generator(z)))
 
     forward = generate
-
-    @torch.no_grad()
-    def sample(self, n: int, seq_len: int, device: torch.device | str | None = None,
-               batch_size: int = 1024) -> torch.Tensor:
-        """Draw n synthetic sequences (n, seq_len, F) in the scaled feature space.
-
-        The output is still scaled; invert it with the training scaler from
-        dataset.py. Generated in chunks of batch_size to bound memory.
-        """
-        device = device or self._device()
-        chunks = [self.generate(self.noise(min(batch_size, n - i), seq_len, device))
-                  for i in range(0, n, batch_size)]
-        return torch.cat(chunks, dim=0)
 
     @torch.no_grad()
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
@@ -524,12 +544,12 @@ class RecurrentGANConfig:
             raise ValueError(f"rnn_type must be one of {tuple(RNN_TYPES)}")
 
 
-class RecurrentGAN(nn.Module):
+class RecurrentGAN(SequenceGAN):
     """Baseline generator: noise (B, T, Z) -> features (B, T, F), judged in feature space.
 
     Exposes the same interface the trainer and predict.py use for TimeGAN:
-    noise, generate, sample, generator_loss, discriminator_loss,
-    should_update_discriminator, *_parameters, networks and parameter_counts.
+    the SequenceGAN methods plus generator_loss, discriminator_loss,
+    should_update_discriminator and *_parameters.
     """
 
     def __init__(self, config: RecurrentGANConfig):
@@ -542,37 +562,17 @@ class RecurrentGAN(nn.Module):
     def networks(self) -> dict[str, nn.Module]:
         return {"generator": self.generator, "discriminator": self.discriminator}
 
-    def parameter_counts(self) -> dict[str, int]:
-        counts = {name: count_parameters(net) for name, net in self.networks().items()}
-        counts["total"] = count_parameters(self)
-        return counts
-
     def generator_parameters(self) -> list[nn.Parameter]:
         return list(self.generator.parameters())
 
     def discriminator_parameters(self) -> list[nn.Parameter]:
         return list(self.discriminator.parameters())
 
-    def _device(self) -> torch.device:
-        return next(self.parameters()).device
-
-    def noise(self, n: int, seq_len: int, device: torch.device | str | None = None) -> torch.Tensor:
-        """Uniform noise on [0, 1), the same prior TimeGAN uses."""
-        return torch.rand(n, seq_len, self.config.z_dim, device=device or self._device())
-
     def generate(self, z: torch.Tensor) -> torch.Tensor:
+        """x_hat = g(z): noise (B, T, Z) -> synthetic features (B, T, F), with gradients."""
         return self.generator(z)
 
     forward = generate
-
-    @torch.no_grad()
-    def sample(self, n: int, seq_len: int, device: torch.device | str | None = None,
-               batch_size: int = 1024) -> torch.Tensor:
-        """Draw n synthetic sequences (n, seq_len, F) in the scaled feature space."""
-        device = device or self._device()
-        chunks = [self.generate(self.noise(min(batch_size, n - i), seq_len, device))
-                  for i in range(0, n, batch_size)]
-        return torch.cat(chunks, dim=0)
 
     def generator_loss(self, x: torch.Tensor, z: torch.Tensor | None = None):
         """Non-saturating adversarial loss for the generator, discriminator frozen.

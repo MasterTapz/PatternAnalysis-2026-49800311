@@ -13,6 +13,7 @@ Prices are dollars times 10,000. Level 1 is the best quote on each side.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,7 +67,7 @@ class OrderBook:
         """Best ask minus best bid in dollars. Positive in a valid book."""
         return self.ask_price[:, 0] - self.bid_price[:, 0]
 
-    def select(self, index) -> "OrderBook":
+    def select(self, index: slice | torch.Tensor) -> "OrderBook":
         """Rows picked by a slice, boolean mask or index tensor, as contiguous copies."""
         return OrderBook(
             time=self.time[index].contiguous(),
@@ -78,6 +79,7 @@ class OrderBook:
 
 
 def _find_one(data_dir: Path, pattern: str) -> Path:
+    """The single file in data_dir matching pattern; anything else is an error."""
     matches = sorted(data_dir.glob(pattern))
     if len(matches) != 1:
         raise FileNotFoundError(
@@ -418,6 +420,21 @@ class LOBWindowDataset(Dataset):
         s = int(self.starts[i])
         return self.time[s:s + self.seq_len]
 
+    def stack(self, indices: Iterable[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Windows (n, T, F) and their anchor mid-prices (n,) for the given indices (all by default)."""
+        idx = list(range(len(self)) if indices is None else indices)
+        windows = torch.stack([self[i] for i in idx])
+        anchors = torch.tensor([self.anchor(i) for i in idx], dtype=torch.float64)
+        return windows, anchors
+
+    def disjoint_indices(self) -> range:
+        """Indices of non-overlapping windows spread over the whole period.
+
+        With a training stride of 1 neighbouring windows share almost every
+        row, so reference sets taken from training data step by seq_len.
+        """
+        return range(0, len(self), self.seq_len)
+
 
 @dataclass
 class LOBSplits:
@@ -429,6 +446,16 @@ class LOBSplits:
     scaler: FeatureScaler
     feature_names: list[str]
     config: dict
+
+    @property
+    def representation(self) -> str:
+        """The feature encoding, "structured" or "raw"."""
+        return self.config["representation"]
+
+    @property
+    def move_flag(self) -> bool:
+        """Whether the encoding carries the binary mid-moved column."""
+        return self.config["move_flag"]
 
 
 def build_datasets(

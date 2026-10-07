@@ -3,6 +3,7 @@
 Shared by train.py (to track progress on the validation hour) and predict.py
 (for the final audit). Every metric works on decoded books in dollars and
 shares, so real and synthetic windows go through exactly the same code path.
+PyTorch only.
 
 Histogram units follow the market's own grid instead of arbitrary bins:
   * spreads are counted in whole ticks (1 tick = 0.01 dollars), with one extra
@@ -15,10 +16,18 @@ resolution choice for the returns distribution, not a different quantity.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import torch
 
-from dataset import TICK, FeatureScaler, OrderBook, decode_book
+from dataset import HALF_TICK, TICK, FeatureScaler, LOBSplits, LOBWindowDataset, OrderBook, decode_book
 
+KL_TARGET = 0.1   # spec target for KL(real || synthetic) of spreads and mid-price returns
+
+
+# ---------------------------------------------------------------------------
+# From scaled windows to order books
+# ---------------------------------------------------------------------------
 
 def decode_windows(windows: torch.Tensor, scaler: FeatureScaler, anchors: torch.Tensor,
                    representation: str, move_flag: bool = False) -> list[OrderBook]:
@@ -34,19 +43,47 @@ def decode_windows(windows: torch.Tensor, scaler: FeatureScaler, anchors: torch.
     return [decode_book(features[i], anchors[i], representation, move_flag=move_flag) for i in range(len(features))]
 
 
-def book_violations(books: list[OrderBook]) -> dict[str, float]:
-    """Share of time steps that break each order book invariant.
+def decode_real_windows(splits: LOBSplits, dataset: LOBWindowDataset,
+                        indices: Iterable[int] | None = None) -> tuple[torch.Tensor, torch.Tensor, list[OrderBook]]:
+    """Real windows (n, T, F), their true anchors (n,) and the decoded books, all windows by default."""
+    windows, anchors = dataset.stack(indices)
+    books = decode_windows(windows, splits.scaler, anchors, splits.representation, splits.move_flag)
+    return windows, anchors, books
+
+
+def decode_synthetic_windows(splits: LOBSplits, windows: torch.Tensor, real_anchors: torch.Tensor,
+                             generator: torch.Generator) -> list[OrderBook]:
+    """Decode generated windows, each anchored at a real anchor drawn at random with generator."""
+    pick = torch.randint(len(real_anchors), (len(windows),), generator=generator)
+    return decode_windows(windows, splits.scaler, real_anchors[pick], splits.representation, splits.move_flag)
+
+
+# ---------------------------------------------------------------------------
+# Validity and distribution metrics
+# ---------------------------------------------------------------------------
+
+def step_violations(book: OrderBook) -> dict[str, torch.Tensor]:
+    """Boolean masks (T,) marking the steps of one book that break each invariant.
 
     crossed      best bid >= best ask (locked or crossed, an arbitrage)
     ladder       ask prices not strictly rising or bid prices not strictly
                  falling across the 10 levels
     negative     any quoted size below zero
-    any          at least one of the above
     """
-    crossed = torch.cat([b.bid_price[:, 0] >= b.ask_price[:, 0] for b in books])
-    ladder = torch.cat([(b.ask_price.diff(dim=1) <= 0).any(dim=1) | (b.bid_price.diff(dim=1) >= 0).any(dim=1)
-                        for b in books])
-    negative = torch.cat([(b.ask_size < 0).any(dim=1) | (b.bid_size < 0).any(dim=1) for b in books])
+    return {
+        "crossed": book.bid_price[:, 0] >= book.ask_price[:, 0],
+        "ladder": (book.ask_price.diff(dim=1) <= 0).any(dim=1) | (book.bid_price.diff(dim=1) >= 0).any(dim=1),
+        "negative": (book.ask_size < 0).any(dim=1) | (book.bid_size < 0).any(dim=1),
+    }
+
+
+def book_violations(books: list[OrderBook]) -> dict[str, float]:
+    """Share of time steps that break each order book invariant (see step_violations).
+
+    any_violation_rate counts the steps that break at least one of them.
+    """
+    masks = [step_violations(b) for b in books]
+    crossed, ladder, negative = (torch.cat([m[kind] for m in masks]) for kind in ("crossed", "ladder", "negative"))
     return {
         "crossed_rate": crossed.double().mean().item(),
         "ladder_rate": ladder.double().mean().item(),
@@ -62,7 +99,7 @@ def spread_ticks(books: list[OrderBook]) -> torch.Tensor:
 
 def mid_moves(books: list[OrderBook]) -> torch.Tensor:
     """Step-to-step mid-price changes in half-ticks, within each book only."""
-    return torch.cat([torch.round(b.mid.diff() / (TICK / 2)) for b in books]).long()
+    return torch.cat([torch.round(b.mid.diff() / HALF_TICK) for b in books]).long()
 
 
 def histogram_kl(p_values: torch.Tensor, q_values: torch.Tensor, low: int, high: int,
@@ -104,3 +141,8 @@ def distribution_report(real: list[OrderBook], fake: list[OrderBook]) -> dict[st
         "spread_bins": spread_high + 1,
         "return_bins": 2 * move_high + 1,
     }
+
+
+def kl_only(report: dict[str, float]) -> dict[str, float]:
+    """The four KL entries of a distribution_report, without the bin counts."""
+    return {k: v for k, v in report.items() if k.startswith("kl")}
