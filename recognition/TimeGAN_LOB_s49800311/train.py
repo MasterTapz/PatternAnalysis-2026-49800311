@@ -7,6 +7,9 @@ Runs the three training phases of Yoon et al. (2019):
                   train together, two generator updates per discriminator one
 The no-supervisor ablation (--no-supervisor) skips phase 2 and drops every
 supervised term, so comparing the two runs isolates what that loss adds.
+The baseline (--model rgan) is a plain recurrent GAN in feature space; it
+skips phases 1 and 2 and trains in the joint phase with one generator and
+one discriminator update per step.
 
 Validation uses the 14:00 to 15:00 hour only. During phase 3, generated
 samples are decoded back into order books and scored against the validation
@@ -16,6 +19,7 @@ lowest validation score is kept as best.pt. The test hour is never touched here.
 Examples (from this folder):
   python train.py --data-dir ../../../../data/LOBSTER
   python train.py --data-dir ../../../../data/LOBSTER --no-supervisor
+  python train.py --data-dir ../../../../data/LOBSTER --model rgan
   python train.py --data-dir ../../../../data/LOBSTER --representation raw
   python train.py --data-dir ../../../../data/LOBSTER --run-name structured_s0 --resume
 """
@@ -32,9 +36,10 @@ from torch.utils.data import DataLoader
 
 from dataset import LOBSplits, LOBWindowDataset, build_datasets
 from metrics import book_violations, decode_windows, distribution_report
-from modules import TimeGAN, TimeGANConfig
+from modules import RecurrentGAN, RecurrentGANConfig, TimeGAN, TimeGANConfig
 
 PHASES = ("autoencoder", "supervisor", "joint")
+MODELS = {"timegan": (TimeGAN, TimeGANConfig), "rgan": (RecurrentGAN, RecurrentGANConfig)}
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +56,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--event-stride", type=int, default=10)
 
     model = p.add_argument_group("model")
+    model.add_argument("--model", choices=tuple(MODELS), default="timegan",
+                       help="timegan, or rgan for the baseline recurrent GAN (one adversarial phase only)")
+    model.add_argument("--baseline-moment-weight", type=float, default=0.0,
+                       help="Optional moment loss weight for the rgan baseline (0 = pure adversarial)")
     model.add_argument("--hidden-dim", type=int, default=64)
     model.add_argument("--num-layers", type=int, default=3)
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
@@ -75,23 +84,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--eval-samples", type=int, default=512)
     run.add_argument("--resume", action="store_true", help="Continue from <run>/last.pt")
     args = p.parse_args(argv)
+    if args.model == "rgan" and args.no_supervisor:
+        p.error("--no-supervisor only applies to --model timegan")
     if args.run_name is None:
-        variant = "nosup" if args.no_supervisor else "timegan"
+        variant = "rgan" if args.model == "rgan" else ("nosup" if args.no_supervisor else "timegan")
         args.run_name = f"{args.representation}_{variant}_s{args.seed}"
     return args
 
 
-def model_config(args: argparse.Namespace, feature_dim: int) -> TimeGANConfig:
-    """TimeGAN settings implied by the command line."""
+def build_model(args: argparse.Namespace, feature_dim: int) -> TimeGAN | RecurrentGAN:
+    """The model implied by the command line: TimeGAN (or its ablation) or the baseline."""
+    activation = "sigmoid" if args.scaling == "minmax" else "identity"
+    if getattr(args, "model", "timegan") == "rgan":
+        return RecurrentGAN(RecurrentGANConfig(
+            feature_dim=feature_dim, hidden_dim=args.hidden_dim, num_layers=args.num_layers,
+            output_activation=activation, moment_weight=args.baseline_moment_weight))
     extra = dict(sqrt_losses=False, eta=10.0, recon_weight=1.0, embed_supervised_weight=1.0) if args.paper_weights else {}
-    return TimeGANConfig(
+    return TimeGAN(TimeGANConfig(
         feature_dim=feature_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        recovery_activation="sigmoid" if args.scaling == "minmax" else "identity",
+        recovery_activation=activation,
         use_supervisor=not args.no_supervisor,
         **extra,
-    )
+    ))
+
+
+def model_from_state(state: dict, device: str) -> TimeGAN | RecurrentGAN:
+    """Rebuild a saved model (TimeGAN, ablation or baseline) from a checkpoint dict."""
+    model_cls, config_cls = MODELS[state.get("model_type", "timegan")]
+    model = model_cls(config_cls(**state["model_config"])).to(device)
+    model.load_state_dict(state["model"])
+    return model.eval()
 
 
 def batches(dataset: LOBWindowDataset, batch_size: int, seed: int, device: str):
@@ -138,8 +162,10 @@ class Evaluator:
         return torch.stack([ds[i] for i in idx]), torch.tensor([ds.anchor(i) for i in idx], dtype=torch.float64)
 
     @torch.no_grad()
-    def reconstruction(self, model: TimeGAN) -> dict[str, float]:
-        """Autoencoder and supervisor error on the validation windows."""
+    def reconstruction(self, model: TimeGAN | RecurrentGAN) -> dict[str, float]:
+        """Autoencoder and supervisor error on the validation windows (TimeGAN only)."""
+        if not isinstance(model, TimeGAN):
+            return {}
         x = self.val_x.to(self.device)
         out = {"val_recon_mse": float(torch.mean((model.reconstruct(x) - x) ** 2))}
         if model.supervisor is not None:
@@ -169,15 +195,17 @@ class Trainer:
     def __init__(self, args: argparse.Namespace, splits: LOBSplits, run_dir: Path):
         self.args, self.splits, self.run_dir = args, splits, run_dir
         self.device = args.device
-        self.model = TimeGAN(model_config(args, len(splits.feature_names))).to(self.device)
+        self.model = build_model(args, len(splits.feature_names)).to(self.device)
+        self.is_timegan = isinstance(self.model, TimeGAN)
         adam = lambda params: torch.optim.Adam(params, lr=args.lr)
         self.optimisers = {
-            "autoencoder": adam(self.model.autoencoder_parameters()),
             "generator": adam(self.model.generator_parameters()),
             "discriminator": adam(self.model.discriminator_parameters()),
         }
-        if self.model.supervisor is not None:
-            self.optimisers["supervisor"] = adam(self.model.supervisor_parameters())
+        if self.is_timegan:
+            self.optimisers["autoencoder"] = adam(self.model.autoencoder_parameters())
+            if self.model.supervisor is not None:
+                self.optimisers["supervisor"] = adam(self.model.supervisor_parameters())
         self.evaluator = Evaluator(splits, args.representation, self.device, args.eval_samples, args.seed)
         self.data = batches(splits.train, args.batch_size, args.seed, self.device)
         self.history = {"train": [], "val": [], "phases": {}}
@@ -188,6 +216,7 @@ class Trainer:
     def _state(self) -> dict:
         return {
             "model": self.model.state_dict(),
+            "model_type": "timegan" if self.is_timegan else "rgan",
             "model_config": asdict(self.model.config),
             "scaler": self.splits.scaler.state_dict(),
             "data_config": self.splits.config,
@@ -255,7 +284,20 @@ class Trainer:
         self._update("supervisor", loss)
         return {k: float(v) for k, v in logs.items()}
 
+    def _baseline_step(self) -> dict:
+        """One generator and one discriminator update for the baseline recurrent GAN."""
+        g_loss, g_logs = self.model.generator_loss(next(self.data))
+        out = {"g_grad_norm": self._update("generator", g_loss)}
+        d_loss, d_logs = self.model.discriminator_loss(next(self.data))
+        out["d_grad_norm"] = self._update("discriminator", d_loss)
+        out["d_updated"] = 1.0
+        out.update({f"g_{k}": float(v) for k, v in g_logs.items()})
+        out.update({f"d_{k}": float(v) for k, v in d_logs.items()})
+        return out
+
     def _joint_step(self) -> dict:
+        if not self.is_timegan:
+            return self._baseline_step()
         out: dict[str, float] = {}
         for _ in range(2):   # two generator and embedder updates per discriminator update, as in the authors' code
             x = next(self.data)
@@ -279,6 +321,10 @@ class Trainer:
         step_fns = {"autoencoder": self._autoencoder_step, "supervisor": self._supervisor_step, "joint": self._joint_step}
         while self.phase_index < len(PHASES):
             phase = PHASES[self.phase_index]
+            if not self.is_timegan and phase != "joint":
+                print(f"Phase {phase}: skipped, the baseline only has the adversarial phase")
+                self.phase_index, self.step = self.phase_index + 1, 0
+                continue
             if phase == "supervisor" and self.model.supervisor is None:
                 print("Phase supervisor: skipped, the ablation has no supervisor")
                 self.phase_index, self.step = self.phase_index + 1, 0
@@ -400,9 +446,7 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, args: argparse.Namespace, n_
     """
     checkpoint = run_dir / "best.pt" if (run_dir / "best.pt").exists() else run_dir / "last.pt"
     state = torch.load(checkpoint, map_location=args.device, weights_only=False)
-    model = TimeGAN(TimeGANConfig(**state["model_config"])).to(args.device)
-    model.load_state_dict(state["model"])
-    model.eval()
+    model = model_from_state(state, args.device)
 
     evaluator = Evaluator(splits, args.representation, args.device, n_samples, args.seed)
     test_x, test_anchor = Evaluator._stack(splits.test, range(len(splits.test)))
@@ -423,7 +467,7 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, args: argparse.Namespace, n_
     report = {
         "checkpoint": checkpoint.name,
         "checkpoint_phase_step": [PHASES[min(state["phase_index"], 2)], state["step"]],
-        "test_recon_mse": float(torch.mean((model.reconstruct(x) - x) ** 2)),
+        "test_recon_mse": float(torch.mean((model.reconstruct(x) - x) ** 2)) if isinstance(model, TimeGAN) else None,
         "violations": book_violations(fake),
         "vs_test_hour": distribution_report(test_books, fake),
         "vs_training_reference": distribution_report(evaluator.train_books, fake),
