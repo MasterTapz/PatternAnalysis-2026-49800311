@@ -87,9 +87,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.model == "rgan" and args.no_supervisor:
         p.error("--no-supervisor only applies to --model timegan")
     if args.run_name is None:
-        variant = "rgan" if args.model == "rgan" else ("nosup" if args.no_supervisor else "timegan")
-        args.run_name = f"{args.representation}_{variant}_s{args.seed}"
+        args.run_name = default_run_name(args)
     return args
+
+
+def default_run_name(args: argparse.Namespace) -> str:
+    """<representation>_<variant>[_paper][_std]_s<seed>, unique for every setting that changes results.
+
+    variant is timegan, nosup (no supervisor), rgan (plain baseline) or rganm
+    (baseline with the moment loss). _paper marks the paper's loss weights and
+    _std marks standard scaling, so these runs never clash with the defaults.
+    """
+    if args.model == "rgan":
+        variant = "rganm" if args.baseline_moment_weight > 0 else "rgan"
+    else:
+        variant = "nosup" if args.no_supervisor else "timegan"
+    suffix = ("_paper" if args.paper_weights and args.model == "timegan" else "") + \
+             ("_std" if args.scaling == "standard" else "")
+    return f"{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
 def build_model(args: argparse.Namespace, feature_dim: int) -> TimeGAN | RecurrentGAN:
