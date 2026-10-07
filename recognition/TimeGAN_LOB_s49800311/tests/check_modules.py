@@ -1,15 +1,13 @@
-"""Smoke test of the networks and losses in src/modules.py on one batch.
+"""Smoke test of src/modules.py on one batch.
 
-For TimeGAN, its no-supervisor ablation and the baseline recurrent GAN, every
-loss runs forward and backward and exactly the intended networks must receive
-finite, non-zero gradients (with every frozen flag restored afterwards);
-sampling must give the right shape and range. A final test overfits the
-autoencoder on one batch to show that phase 1 can learn more than the
-per-feature means. Peak CUDA memory is reported for the README resource table.
+For TimeGAN, its no-supervisor ablation and the baseline, every loss runs
+forward and backward and only the intended networks may get gradients.
+Sampling must give the right shape and range. A last test overfits the
+autoencoder on one batch to show phase 1 learns more than the feature means.
 
-Run from the project folder (the one holding src/ and tests/):
+Run from the folder holding src/ and tests/:
   python tests/check_modules.py --data-dir ../../../../data/LOBSTER
-Without --data-dir a random batch is used instead of real windows.
+Without --data-dir a random batch is used.
 """
 from __future__ import annotations
 
@@ -19,18 +17,18 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))   # make the src modules importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from modules import RNN_TYPES, RecurrentGAN, RecurrentGANConfig, TimeGAN, TimeGANConfig  # noqa: E402
 
 
 def load_batch(data_dir: str | None, batch_size: int, seq_len: int, feature_dim: int, seed: int) -> torch.Tensor:
-    """A random batch of real training windows, or uniform noise when no data folder is given."""
+    """Random real training windows, or uniform noise when no data folder is given."""
     g = torch.Generator().manual_seed(seed)
     if data_dir is None:
         print(f"No --data-dir given, using random data of shape ({batch_size}, {seq_len}, {feature_dim})")
         return torch.rand(batch_size, seq_len, feature_dim, generator=g)
-    from dataset import build_datasets  # imported here so the random-data path never needs pandas
+    from dataset import build_datasets   # here so the random-data path never needs pandas
     splits = build_datasets(data_dir, seq_len=seq_len, representation="structured")
     idx = torch.randperm(len(splits.train), generator=g)[:batch_size]
     print(f"Loaded {len(idx)} of {len(splits.train)} real training windows from {data_dir}")
@@ -38,7 +36,7 @@ def load_batch(data_dir: str | None, batch_size: int, seq_len: int, feature_dim:
 
 
 def check_gradients(model: TimeGAN, trained: set[str], phase: str) -> None:
-    """Every parameter of the trained networks has a finite gradient; all others have none."""
+    """Trained networks have finite, non-zero gradients; the others have none."""
     for name, net in model.networks().items():
         grads = [(pname, p.grad) for pname, p in net.named_parameters()]
         if name in trained:
@@ -52,8 +50,13 @@ def check_gradients(model: TimeGAN, trained: set[str], phase: str) -> None:
     assert all(p.requires_grad for p in model.parameters()), f"{phase}: a frozen flag was not restored"
 
 
+def print_sample(samples: torch.Tensor) -> None:
+    print(f"  sample                  shape {tuple(samples.shape)}  range [{float(samples.min()):.3f}, "
+          f"{float(samples.max()):.3f}]")
+
+
 def check_model(x: torch.Tensor, config: TimeGANConfig, label: str) -> None:
-    """Run every phase loss forward and backward, check gradients, sample, report memory."""
+    """Every phase loss forward and backward, then sampling and peak memory."""
     device = x.device
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -90,44 +93,43 @@ def check_model(x: torch.Tensor, config: TimeGANConfig, label: str) -> None:
     assert bool(torch.isfinite(samples).all())
     if config.recovery_activation == "sigmoid":
         assert float(samples.min()) >= 0 and float(samples.max()) <= 1, "sigmoid output left [0, 1]"
-    print(f"  sample                  shape {tuple(samples.shape)}  range [{float(samples.min()):.3f}, "
-          f"{float(samples.max()):.3f}]")
+    print_sample(samples)
     if device.type == "cuda":
         print(f"  peak CUDA memory        {torch.cuda.max_memory_allocated(device) / 2**20:.1f} MiB")
 
 
 def check_baseline(x: torch.Tensor, config: RecurrentGANConfig) -> None:
-    """Both baseline losses run, train only their own network, and sampling works."""
+    """Both baseline losses train only their own network, and sampling works."""
     model = RecurrentGAN(config).to(x.device).train()
     print(f"\n[baseline recurrent GAN] parameters: {model.parameter_counts()}")
-    for phase, loss_fn, trained in [("generator", lambda: model.generator_loss(x), {"generator"}),
-                                    ("discriminator", lambda: model.discriminator_loss(x), {"discriminator"})]:
+    phases = [("generator", lambda: model.generator_loss(x), {"generator"}),
+              ("discriminator", lambda: model.discriminator_loss(x), {"discriminator"})]
+    for phase, loss_fn, trained in phases:
         model.zero_grad(set_to_none=True)
         loss, logs = loss_fn()
         assert loss.dim() == 0 and bool(torch.isfinite(loss)), f"baseline {phase}: loss is not a finite scalar"
         loss.backward()
         for name, net in model.networks().items():
             has_grad = [p.grad is not None for p in net.parameters()]
-            assert all(has_grad) if name in trained else not any(has_grad), f"baseline {phase}: wrong gradients on {name}"
+            ok = all(has_grad) if name in trained else not any(has_grad)
+            assert ok, f"baseline {phase}: wrong gradients on {name}"
         assert all(p.requires_grad for p in model.parameters()), f"baseline {phase}: a frozen flag was not restored"
         print(f"  {phase:23s} " + "  ".join(f"{k} {float(v):.4f}" for k, v in logs.items()))
     samples = model.sample(512, x.shape[1], x.device, batch_size=200)
     assert samples.shape == (512, x.shape[1], x.shape[2]) and bool(torch.isfinite(samples).all())
-    print(f"  sample                  shape {tuple(samples.shape)}  range [{float(samples.min()):.3f}, "
-          f"{float(samples.max()):.3f}]")
+    print_sample(samples)
 
 
 def overfit_autoencoder(x: torch.Tensor, config: TimeGANConfig, steps: int) -> None:
-    """Phase 1 on a single batch: reconstruction must beat predicting each feature's mean.
+    """Phase 1 on one batch must beat predicting each feature's mean.
 
-    Falling from the initial error alone proves little: the recovery's output
-    bias can learn the per-feature means within a few hundred steps and stop
-    there. Outputting the batch mean of every feature gives an MSE equal to
-    the average per-feature variance, so the check is against that baseline.
+    The recovery bias alone can learn the feature means, so a falling loss
+    proves little; the bar is the MSE of the mean prediction (the average
+    per-feature variance).
     """
     torch.manual_seed(0)
     model = TimeGAN(config).to(x.device).train()
-    optimiser = torch.optim.Adam(model.autoencoder_parameters(), lr=1e-3)   # learning rate as in the paper
+    optimiser = torch.optim.Adam(model.autoencoder_parameters(), lr=1e-3)
     mean_baseline = float(((x - x.mean(dim=(0, 1))) ** 2).mean())
     with torch.no_grad():
         before = float(model.autoencoder_loss(x)[1]["recon_mse"])
@@ -169,7 +171,7 @@ def main(argv: list[str] | None = None) -> None:
 
     base = dict(feature_dim=batch.shape[-1], hidden_dim=args.hidden_dim, num_layers=args.num_layers,
                 rnn_type=args.rnn_type)
-    # The order matters for reproducibility: every model draws its initial weights from the global seed.
+    # Keep this order: each model draws its initial weights from the global seed.
     check_model(batch, TimeGANConfig(**base), "TimeGAN")
     check_model(batch, TimeGANConfig(**base, use_supervisor=False), "ablation: no supervisor")
     check_baseline(batch, RecurrentGANConfig(**base))

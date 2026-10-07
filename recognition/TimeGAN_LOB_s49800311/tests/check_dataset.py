@@ -1,10 +1,9 @@
-"""Self-check of the data pipeline in src/dataset.py on the real LOBSTER session.
+"""Checks of src/dataset.py on the real LOBSTER session.
 
-Asserts that every encoding decodes real books back exactly, that the
-train, validation and test periods are in strict chronological order, and
-that a scaled real test window decodes back to a valid book on the tick grid.
+Every encoding must decode real books back exactly, the three periods must
+be in time order, and a scaled real test window must decode to a valid book.
 
-Run from the project folder (the one holding src/ and tests/):
+Run from the folder holding src/ and tests/:
   python tests/check_dataset.py --data-dir ../../../../data/LOBSTER
 """
 from __future__ import annotations
@@ -13,14 +12,14 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))   # make the src modules importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from dataset import (REPRESENTATIONS, build_datasets, decode_book, encode_book, load_lobster,  # noqa: E402
                      subsample_events, trim_session)
 
 
 def round_trip_check(data_dir: str, seq_len: int) -> None:
-    """Encoding then decoding real books must reproduce them exactly, in every encoding."""
+    """Encoding then decoding real books must give them back exactly, in every encoding."""
     book = subsample_events(trim_session(load_lobster(data_dir)), 10)
     target = book.select(slice(1, None))
     for representation in REPRESENTATIONS:
@@ -30,14 +29,17 @@ def round_trip_check(data_dir: str, seq_len: int) -> None:
             for s in range(0, len(x), seq_len):
                 d = decode_book(x[s:s + seq_len], book.mid[s], representation, move_flag=move_flag)
                 t = target.select(slice(s, s + seq_len))
-                worst = max(worst, (d.ask_price - t.ask_price).abs().max().item(),
-                            (d.bid_price - t.bid_price).abs().max().item(), (d.mid - t.mid).abs().max().item())
+                worst = max(worst,
+                            (d.ask_price - t.ask_price).abs().max().item(),
+                            (d.bid_price - t.bid_price).abs().max().item(),
+                            (d.mid - t.mid).abs().max().item())
             assert worst < 1e-9, f"{representation} move_flag={move_flag}: round trip off by {worst}"
-            print(f"  round trip {representation:10s} move_flag={move_flag!s:5s}: max price error {worst:.1e} dollars")
+            print(f"  round trip {representation:10s} move_flag={move_flag!s:5s}: "
+                  f"max price error {worst:.1e} dollars")
 
 
 def split_check(data_dir: str, seq_len: int, representation: str, move_flag: bool) -> None:
-    """One encoding's splits are chronological, scaled on train only, and decode to a valid book."""
+    """The splits are in time order, and a scaled real window decodes to a valid book."""
     splits = build_datasets(data_dir, seq_len=seq_len, representation=representation, move_flag=move_flag)
     print(f"\n[{representation}, move_flag={move_flag}] {len(splits.feature_names)} features, config {splits.config}")
 
@@ -51,7 +53,6 @@ def split_check(data_dir: str, seq_len: int, representation: str, move_flag: boo
     assert splits.train.time[-1] < splits.val.time[0] < splits.val.time[-1] < splits.test.time[0]
     assert splits.train[0].shape == (seq_len, len(splits.feature_names))
 
-    # A scaled real window must decode back to a valid book on the tick grid.
     ds = splits.test
     decoded = decode_book(splits.scaler.inverse_transform(ds[0]), ds.anchor(0), representation, move_flag=move_flag)
     assert bool((decoded.ask_price[:, 0] > decoded.bid_price[:, 0]).all()), "real window decoded crossed"
