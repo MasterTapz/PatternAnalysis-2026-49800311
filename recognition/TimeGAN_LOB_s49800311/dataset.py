@@ -12,6 +12,7 @@ Prices are dollars times 10,000. Level 1 is the best quote on each side.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -183,12 +184,21 @@ def split_by_time(time: torch.Tensor, train_end: str = "14:00", val_end: str = "
 #
 # Row j of the features describes book row j + 1; book row 0 only anchors the
 # first return, so its mid-price is passed back in when decoding.
+#
+# Optional move flag (move_flag=True) inserts one binary column "mid_moved"
+# right after the log-return: 1 when the mid-price changed by at least one
+# half-tick, 0 when it did not. About half of all real steps have no move, a
+# spike at exactly zero that a generator emitting continuous values almost
+# never hits. With the flag, the model decides "move or not" in its own
+# column and the log-return only sets the size of a move. Decoding keeps the
+# mid on the half-tick grid that real mid-prices always sit on.
 # ---------------------------------------------------------------------------
 
 REPRESENTATIONS = ("structured", "raw")
+HALF_TICK = TICK / 2            # the smallest possible mid-price move
 
 
-def feature_names(representation: str = "structured", levels: int = 10) -> list[str]:
+def feature_names(representation: str = "structured", levels: int = 10, move_flag: bool = False) -> list[str]:
     """Human-readable name of every feature column, in order."""
     if representation == "structured":
         prices = ["log_spread_ticks"]
@@ -201,13 +211,17 @@ def feature_names(representation: str = "structured", levels: int = 10) -> list[
         raise ValueError(f"representation must be one of {REPRESENTATIONS}")
     sizes = [f"log1p_ask_size_{k}" for k in range(1, levels + 1)]
     sizes += [f"log1p_bid_size_{k}" for k in range(1, levels + 1)]
-    return ["mid_log_return"] + prices + sizes
+    return ["mid_log_return"] + (["mid_moved"] if move_flag else []) + prices + sizes
 
 
-def encode_book(book: OrderBook, representation: str = "structured") -> torch.Tensor:
+def encode_book(book: OrderBook, representation: str = "structured", move_flag: bool = False) -> torch.Tensor:
     """Encode book rows 1..N-1 as float64 features of shape (N - 1, F)."""
     mid = book.mid
     log_return = torch.log(mid[1:]) - torch.log(mid[:-1])
+    returns = [log_return[:, None]]
+    if move_flag:
+        moved = torch.round(torch.diff(mid) / HALF_TICK) != 0
+        returns.append(moved.double()[:, None])
     ask, bid = book.ask_price[1:], book.bid_price[1:]
 
     if representation == "structured":
@@ -224,12 +238,31 @@ def encode_book(book: OrderBook, representation: str = "structured") -> torch.Te
         raise ValueError(f"representation must be one of {REPRESENTATIONS}")
 
     sizes = torch.log1p(torch.cat([book.ask_size[1:], book.bid_size[1:]], dim=1))
-    return torch.cat([log_return[:, None], prices, sizes], dim=1)
+    return torch.cat(returns + [prices, sizes], dim=1)
 
 
 def _snap(price: torch.Tensor) -> torch.Tensor:
     """Round dollar prices to the nearest tick."""
     return torch.round(price / TICK) * TICK
+
+
+def _flagged_mid_path(log_returns: torch.Tensor, moved: torch.Tensor, prev_mid: float, round_to_tick: bool) -> torch.Tensor:
+    """Mid-price path when a move flag is present.
+
+    A step with moved < 0.5 leaves the mid unchanged. Otherwise the mid moves
+    by the log-return, rounded to whole half-ticks and at least one, so the
+    flag alone decides whether the price changes. The loop is sequential
+    because each step's dollar move depends on the previous mid.
+    """
+    mid, path = float(prev_mid), []
+    for r, flag in zip(log_returns.tolist(), moved.tolist()):
+        if flag >= 0.5:
+            move = mid * math.expm1(r)
+            if round_to_tick:
+                move = math.copysign(max(1, round(abs(move) / HALF_TICK)) * HALF_TICK, move)
+            mid += move
+        path.append(mid)
+    return torch.tensor(path, dtype=torch.float64)
 
 
 def decode_book(
@@ -238,18 +271,24 @@ def decode_book(
     representation: str = "structured",
     levels: int = 10,
     round_to_tick: bool = True,
+    move_flag: bool = False,
 ) -> OrderBook:
     """Invert encode_book for one sequence of shape (T, F).
 
     prev_mid is the mid-price just before the first row; the mid path is
-    rebuilt by compounding the log-returns from it. No constraint is enforced
-    here: whatever the features imply, including crossed books, negative
-    sizes or repeated levels, is passed through for the audit to count.
+    rebuilt by compounding the log-returns from it (or, with move_flag, by
+    moving only on flagged steps). No constraint is enforced here: whatever
+    the features imply, including crossed books, negative sizes or repeated
+    levels, is passed through for the audit to count.
     """
     f = features.double()
-    if f.dim() != 2 or f.shape[1] != len(feature_names(representation, levels)):
+    if f.dim() != 2 or f.shape[1] != len(feature_names(representation, levels, move_flag)):
         raise ValueError("features must have shape (T, F) for the given representation")
-    mid = torch.as_tensor(prev_mid, dtype=torch.float64) * torch.exp(torch.cumsum(f[:, 0], dim=0))
+    if move_flag:
+        mid = _flagged_mid_path(f[:, 0], f[:, 1], float(prev_mid), round_to_tick)
+        f = torch.cat([f[:, :1], f[:, 2:]], dim=1)     # drop the flag; the rest keeps the usual layout
+    else:
+        mid = torch.as_tensor(prev_mid, dtype=torch.float64) * torch.exp(torch.cumsum(f[:, 0], dim=0))
 
     if representation == "structured":
         spread_ticks = torch.exp(f[:, 1])
@@ -404,6 +443,7 @@ def build_datasets(
     val_end: str = "15:00",
     train_stride: int = 1,
     eval_stride: int | None = None,
+    move_flag: bool = False,
 ) -> LOBSplits:
     """Run the full pipeline: load, trim, subsample, encode, split, scale, window.
 
@@ -418,7 +458,7 @@ def build_datasets(
     config["eval_stride"] = eval_stride = eval_stride or seq_len
 
     book = subsample_events(trim_session(load_lobster(data_dir), open_minutes, close_minutes), event_stride)
-    features = encode_book(book, representation)
+    features = encode_book(book, representation, move_flag)
     prev_mid = book.mid[:-1]
     time = book.time[1:]
     parts = split_by_time(time, train_end, val_end)
@@ -435,16 +475,35 @@ def build_datasets(
         val=window("val", eval_stride),
         test=window("test", eval_stride),
         scaler=scaler,
-        feature_names=feature_names(representation, book.levels),
+        feature_names=feature_names(representation, book.levels, move_flag),
         config=config,
     )
 
 
+def _round_trip_check(data_dir: str, seq_len: int) -> None:
+    """Encoding then decoding real books must reproduce them exactly, in every encoding."""
+    book = subsample_events(trim_session(load_lobster(data_dir)), 10)
+    target = book.select(slice(1, None))
+    for representation in REPRESENTATIONS:
+        for move_flag in (False, True):
+            x = encode_book(book, representation, move_flag)
+            worst = 0.0
+            for s in range(0, len(x), seq_len):
+                d = decode_book(x[s:s + seq_len], book.mid[s], representation, move_flag=move_flag)
+                t = target.select(slice(s, s + seq_len))
+                worst = max(worst, (d.ask_price - t.ask_price).abs().max().item(),
+                            (d.bid_price - t.bid_price).abs().max().item(), (d.mid - t.mid).abs().max().item())
+            assert worst < 1e-9, f"{representation} move_flag={move_flag}: round trip off by {worst}"
+            print(f"  round trip {representation:10s} move_flag={move_flag!s:5s}: max price error {worst:.1e} dollars")
+
+
 def _self_check(data_dir: str, seq_len: int) -> None:
     """Rebuild the pipeline and assert its leakage and round-trip guarantees."""
-    for representation in REPRESENTATIONS:
-        splits = build_datasets(data_dir, seq_len=seq_len, representation=representation)
-        print(f"\n[{representation}] {len(splits.feature_names)} features, config {splits.config}")
+    print("Exact round trip of every encoding on the real session:")
+    _round_trip_check(data_dir, seq_len)
+    for representation, move_flag in [(r, m) for r in REPRESENTATIONS for m in (False, True)]:
+        splits = build_datasets(data_dir, seq_len=seq_len, representation=representation, move_flag=move_flag)
+        print(f"\n[{representation}, move_flag={move_flag}] {len(splits.feature_names)} features, config {splits.config}")
 
         for name in ("train", "val", "test"):
             ds = getattr(splits, name)
@@ -458,7 +517,7 @@ def _self_check(data_dir: str, seq_len: int) -> None:
 
         # A scaled real window must decode back to a valid book on the tick grid.
         ds = splits.test
-        decoded = decode_book(splits.scaler.inverse_transform(ds[0]), ds.anchor(0), representation)
+        decoded = decode_book(splits.scaler.inverse_transform(ds[0]), ds.anchor(0), representation, move_flag=move_flag)
         assert bool((decoded.ask_price[:, 0] > decoded.bid_price[:, 0]).all()), "real window decoded crossed"
         assert bool((decoded.ask_price.diff(dim=1) > 0).all() and (decoded.bid_price.diff(dim=1) < 0).all())
         print(f"  first test window decodes to a valid book, best bid/ask "
