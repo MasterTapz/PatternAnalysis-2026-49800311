@@ -17,13 +17,17 @@ For every run given with --run this script:
      their closest real window, and an autocorrelation plot
 
 With several runs, it also writes a comparison table and a combined
-autocorrelation plot. The analysis itself lives in helpers/audit.py and the
-figures in helpers/plotting.py. NumPy and scikit-image are used there for
-SSIM and plots, which the spec allows on the prediction side.
+autocorrelation plot. With --export-assets DIR it then copies the figures
+the README embeds out of the runs folder into DIR and draws the ladder-rate
+figure; this needs no model, so it also works without --run.
+The analysis itself lives in helpers/audit.py and the figures in
+helpers/plotting.py. NumPy and scikit-image are used there for SSIM and
+plots, which the spec allows on the prediction side.
 
-Example (from the project folder, the one holding src/):
+Examples (from the project folder, the one holding src/):
   python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0
   python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0 runs/structured_rgan_s0
+  python src/predict.py --export-assets assets
 """
 from __future__ import annotations
 
@@ -35,19 +39,27 @@ import torch
 
 from helpers.audit import RunAudit, audit_run, comparison_table, print_example_book, print_summary
 from helpers.checkpoints import load_run
-from helpers.plotting import plot_autopsy, plot_volatility_acf, plot_volatility_comparison
+from helpers.plotting import export_readme_assets, plot_autopsy, plot_volatility_acf, plot_volatility_comparison
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", required=True, help="Folder holding the LOBSTER CSVs")
-    p.add_argument("--run", nargs="+", required=True, help="One or more run folders produced by train.py")
+    p.add_argument("--data-dir", default=None, help="Folder holding the LOBSTER CSVs (needed with --run)")
+    p.add_argument("--run", nargs="+", default=[], help="One or more run folders produced by train.py")
     p.add_argument("--n-samples", type=int, default=1024)
     p.add_argument("--ssim-pool", type=int, default=256, help="Synthetic and training windows used for nearest-match SSIM")
     p.add_argument("--out-dir", default="runs/comparison", help="Where the multi-run comparison goes")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args(argv)
+    p.add_argument("--export-assets", default=None, metavar="DIR",
+                   help="Copy the README figures out of --runs-dir into DIR and draw the ladder-rate figure")
+    p.add_argument("--runs-dir", default="runs", help="Folder holding every run, read by --export-assets")
+    args = p.parse_args(argv)
+    if not args.run and args.export_assets is None:
+        p.error("give --run, --export-assets or both")
+    if args.run and args.data_dir is None:
+        p.error("--run needs --data-dir to rebuild the data pipeline")
+    return args
 
 
 def audit_and_save(run_dir: Path, args: argparse.Namespace) -> RunAudit:
@@ -89,6 +101,10 @@ def main(argv: list[str] | None = None) -> None:
     audits = [audit_and_save(Path(r), args) for r in args.run]
     if len(audits) > 1:
         write_comparison(audits, Path(args.out_dir))
+    if args.export_assets is not None:
+        # Runs after the audit, so a combined call exports the figures it has just redrawn.
+        for path in export_readme_assets(Path(args.runs_dir), Path(args.export_assets)):
+            print(f"{path}  {path.stat().st_size / 1024:.0f} KB")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
-"""Every figure the project draws: training curves, heatmap autopsies and volatility clustering."""
+"""Every figure the project draws: training curves, heatmap autopsies, volatility clustering and the README assets."""
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import matplotlib
@@ -144,4 +146,87 @@ def plot_volatility_comparison(real_train: np.ndarray, real_test: np.ndarray,
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# README assets
+# ---------------------------------------------------------------------------
+
+# Run outputs the README embeds, copied under clear names: asset name -> path inside the runs folder.
+README_COPIES = {
+    "training_curves_structured_timegan.png": "structured_timegan_s0/training_curves.png",
+    "autopsy_structured_timegan.png": "structured_timegan_s0/predict/autopsy.png",
+    "autopsy_raw_timegan.png": "raw_timegan_s0/predict/autopsy.png",
+    "autopsy_structured_rganm.png": "structured_rganm_s0/predict/autopsy.png",
+    "volatility_acf_comparison.png": "comparison/volatility_acf_comparison.png",
+}
+LADDER_FIGURE = "ladder_rate_raw_joint_phase.png"
+
+# Raw-encoding runs in the ladder figure: (run folder, legend label, colour, marker, line style).
+# Colours are the first three slots of a colour-blind-checked categorical palette;
+# the markers and line styles differ too, so the series do not rely on colour alone.
+LADDER_RUNS = [
+    ("raw_timegan_s0", "TimeGAN", "#2a78d6", "o", "-"),
+    ("raw_nosup_s0", "TimeGAN without supervisor", "#eb6834", "s", "--"),
+    ("raw_rganm_s0", "recurrent GAN + moment loss", "#1baf7a", "^", ":"),
+]
+
+
+def export_readme_assets(runs_dir: Path, out_dir: Path) -> list[Path]:
+    """Collect the README figures from the run folders into out_dir; returns every PNG there.
+
+    Copies the run outputs listed in README_COPIES (the originals stay in
+    runs/) and draws one new figure from the raw-encoding runs' history.json
+    files. Only history files and PNGs are read; no model is loaded.
+    """
+    out_dir.mkdir(exist_ok=True)
+    for name, source in README_COPIES.items():
+        shutil.copy2(runs_dir / source, out_dir / name)
+    plot_ladder(runs_dir, out_dir / LADDER_FIGURE)
+    return sorted(out_dir.glob("*.png"))
+
+
+def joint_validation(history_path: Path) -> list[dict]:
+    """Validation records of the joint (adversarial) phase, in step order."""
+    history = json.loads(history_path.read_text())
+    return sorted((r for r in history["val"] if r["phase"] == "joint"), key=lambda r: r["step"])
+
+
+def best_step(records: list[dict]) -> int:
+    """Step of the checkpoint kept as best.pt: the last record flagged new_best."""
+    return [r["step"] for r in records if r.get("new_best")][-1]
+
+
+def plot_ladder(runs_dir: Path, path: Path) -> None:
+    """Broken-ladder rate and validation spread KL across the joint phase, each run's best.pt step ringed.
+
+    Two panels share the step axis, one per measure.
+    """
+    fig, (ax_ladder, ax_kl) = plt.subplots(1, 2, figsize=(11, 4.0), sharex=True)
+    for run, label, colour, marker, style in LADDER_RUNS:
+        records = joint_validation(runs_dir / run / "history.json")
+        steps = [r["step"] for r in records]
+        best = best_step(records)
+        for ax, key in [(ax_ladder, "ladder_rate"), (ax_kl, "val_kl_spread")]:
+            values = [r[key] for r in records]
+            ax.plot(steps, values, linestyle=style, linewidth=2, color=colour, marker=marker, markersize=5, label=label)
+            # Hollow ring on the step kept as best.pt, so the reader sees where model selection stopped.
+            ax.plot([best], [values[steps.index(best)]], marker="o", markersize=13, markerfacecolor="none",
+                    markeredgecolor=colour, markeredgewidth=1.5, linestyle="none")
+
+    ax_ladder.set(title="Broken ladder rate on generated books (raw encoding)", xlabel="joint-phase step",
+                  ylabel="share of time steps with a broken ladder", ylim=(0, 1.05))
+    ax_kl.axhline(KL_TARGET, color="#6b6b6b", linestyle="--", linewidth=1)
+    ax_kl.text(4_300, KL_TARGET - 0.005, f"target {KL_TARGET}", color="#4a4a4a", fontsize=8, ha="left", va="top")
+    # The baseline starts far above the others (3.06 at step 500), so the axis is cut to keep the rest readable.
+    ax_kl.set(title="Spread KL against the validation hour (axis cut at 0.45)", xlabel="joint-phase step",
+              ylabel="KL(real || synthetic)", ylim=(0, 0.45))
+    for ax in (ax_ladder, ax_kl):
+        ax.grid(alpha=0.25)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    ax_ladder.legend(fontsize=8, loc="lower right", title="ring = best.pt", title_fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
     plt.close(fig)
