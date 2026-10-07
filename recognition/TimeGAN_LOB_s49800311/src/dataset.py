@@ -1,16 +1,12 @@
-"""Data loading and preprocessing for the LOBSTER limit order book sample.
+"""Loading and preprocessing of the LOBSTER AMZN level 10 sample.
 
-The LOBSTER sample (AMZN, 2012-06-21, 10 levels) ships as two header-less CSVs:
-a message file with one row per order book event, and an order book file whose
-row i is the state of the book right after message i. This module turns those
-files into fixed-length feature windows for TimeGAN while keeping the training,
-validation and test periods in strict chronological order.
+LOBSTER ships two CSVs without headers: a message file (one row per event)
+and an order book file whose row i is the book right after message i. Each
+book row holds ask price, ask size, bid price and bid size for levels 1 to
+10, with prices in dollars times 10,000.
 
-Column layout of the order book file, repeated for levels 1 to 10:
-    ask price, ask size, bid price, bid size
-Prices are dollars times 10,000. Level 1 is the best quote on each side.
-
-The round-trip and split checks for this module are in tests/check_dataset.py.
+The pipeline is load -> trim -> subsample -> encode -> split -> scale -> window,
+and the train, validation and test periods stay in time order.
 """
 from __future__ import annotations
 
@@ -23,27 +19,28 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-PRICE_SCALE = 10_000             # LOBSTER stores dollars times 10,000
-TICK = 0.01                      # AMZN minimum price increment in dollars
-EMPTY_ASK = 9_999_999_999        # LOBSTER dummy price for an unoccupied ask level
-EMPTY_BID = -9_999_999_999       # LOBSTER dummy price for an unoccupied bid level
-HALT_EVENT = 7                   # message type marking a trading halt
+PRICE_SCALE = 10_000             # LOBSTER prices are dollars times 10,000
+TICK = 0.01                      # AMZN tick size in dollars
+HALF_TICK = TICK / 2             # smallest possible mid-price move
+EMPTY_ASK = 9_999_999_999        # LOBSTER placeholder for an empty ask level
+EMPTY_BID = -9_999_999_999       # LOBSTER placeholder for an empty bid level
+HALT_EVENT = 7                   # message type of a trading halt
 MARKET_OPEN = 9.5 * 3600         # 09:30 in seconds after midnight
 MARKET_CLOSE = 16 * 3600         # 16:00 in seconds after midnight
+REPRESENTATIONS = ("structured", "raw")
 
 
 def clock_to_seconds(hhmm: str) -> float:
-    """Convert a 'HH:MM' wall-clock string to seconds after midnight."""
+    """'HH:MM' to seconds after midnight."""
     hours, minutes = hhmm.split(":")
     return int(hours) * 3600 + int(minutes) * 60
 
 
 @dataclass
 class OrderBook:
-    """A time-ordered sequence of order book snapshots.
+    """A sequence of book snapshots, prices in dollars and sizes in shares.
 
-    Prices are float64 dollars so tick arithmetic stays exact, sizes are shares.
-    Every price and size tensor has shape (N, levels), with level 1 in column 0.
+    Price and size tensors have shape (N, levels) with level 1 in column 0.
     """
 
     time: torch.Tensor        # (N,) seconds after midnight
@@ -61,16 +58,14 @@ class OrderBook:
 
     @property
     def mid(self) -> torch.Tensor:
-        """Mid-price, the average of the best ask and best bid."""
         return (self.ask_price[:, 0] + self.bid_price[:, 0]) / 2
 
     @property
     def spread(self) -> torch.Tensor:
-        """Best ask minus best bid in dollars. Positive in a valid book."""
         return self.ask_price[:, 0] - self.bid_price[:, 0]
 
-    def select(self, index: slice | torch.Tensor) -> "OrderBook":
-        """Rows picked by a slice, boolean mask or index tensor, as contiguous copies."""
+    def select(self, index: slice | torch.Tensor) -> OrderBook:
+        """The rows picked by a slice, mask or index tensor."""
         return OrderBook(
             time=self.time[index].contiguous(),
             ask_price=self.ask_price[index].contiguous(),
@@ -80,24 +75,22 @@ class OrderBook:
         )
 
 
+# ---------------------------------------------------------------------------
+# Loading and splitting
+# ---------------------------------------------------------------------------
+
 def _find_one(data_dir: Path, pattern: str) -> Path:
-    """The single file in data_dir matching pattern; anything else is an error."""
     matches = sorted(data_dir.glob(pattern))
     if len(matches) != 1:
-        raise FileNotFoundError(
-            f"Expected exactly one file matching {pattern!r} in {data_dir}, found {len(matches)}"
-        )
+        raise FileNotFoundError(f"Expected one file matching {pattern!r} in {data_dir}, found {len(matches)}")
     return matches[0]
 
 
 def load_lobster(data_dir: str | Path, levels: int = 10) -> OrderBook:
-    """Read a LOBSTER message/order book file pair into an OrderBook.
+    """Read the message and order book files of one LOBSTER day.
 
-    Only the event timestamps are taken from the message file; the book file
-    already holds the state after every event. Unoccupied levels and trading
-    halts are rejected rather than silently patched, because both would break
-    the price ladder that the rest of the pipeline relies on. The AMZN sample
-    contains neither.
+    Only the timestamps come from the message file. Empty levels and trading
+    halts raise an error instead of being patched; the AMZN sample has neither.
     """
     data_dir = Path(data_dir)
     message_path = _find_one(data_dir, f"*_message_{levels}.csv")
@@ -111,11 +104,11 @@ def load_lobster(data_dir: str | Path, levels: int = 10) -> OrderBook:
     if book.shape[1] != 4 * levels:
         raise ValueError(f"Expected {4 * levels} order book columns, found {book.shape[1]}")
     if (messages["type"] == HALT_EVENT).any():
-        raise ValueError("Trading halt found; split the session around it before loading")
+        raise ValueError("The session contains a trading halt")
 
     ask_raw, bid_raw = book[:, 0::4], book[:, 2::4]
     if (ask_raw == EMPTY_ASK).any() or (bid_raw == EMPTY_BID).any():
-        raise ValueError("Unoccupied price levels found; request fewer levels or mask them")
+        raise ValueError("The book has empty price levels; load fewer levels")
 
     return OrderBook(
         time=torch.tensor(messages["time"].to_numpy(), dtype=torch.float64),
@@ -127,11 +120,10 @@ def load_lobster(data_dir: str | Path, levels: int = 10) -> OrderBook:
 
 
 def trim_session(book: OrderBook, open_minutes: float = 10, close_minutes: float = 10) -> OrderBook:
-    """Drop the first and last minutes of continuous trading.
+    """Drop the first and last minutes of trading.
 
-    On the AMZN sample the first 10 minutes run at about twice the usual spread
-    and the last 10 minutes at about twice the usual event rate, so both behave
-    unlike the rest of the day.
+    On this day the opening minutes have about twice the usual spread and the
+    closing minutes about twice the usual event rate.
     """
     start = MARKET_OPEN + open_minutes * 60
     end = MARKET_CLOSE - close_minutes * 60
@@ -139,71 +131,46 @@ def trim_session(book: OrderBook, open_minutes: float = 10, close_minutes: float
 
 
 def subsample_events(book: OrderBook, stride: int) -> OrderBook:
-    """Keep every stride-th snapshot, so one step spans a fixed number of events.
-
-    Sampling by events rather than by clock time keeps the event-driven nature
-    of the book: busy periods produce more steps per minute than quiet ones.
-    """
+    """Keep every stride-th snapshot, so one step is a fixed number of events."""
     if stride < 1:
         raise ValueError("stride must be at least 1")
     return book.select(slice(None, None, stride))
 
 
 def split_by_time(time: torch.Tensor, train_end: str = "14:00", val_end: str = "15:00") -> dict[str, slice]:
-    """Contiguous train, validation and test row ranges cut at wall-clock times.
-
-    Training uses the earliest hours and testing the latest, so no model ever
-    sees data from after the period it is evaluated on.
-    """
+    """Train, validation and test row ranges cut at clock times."""
     if not bool((time[1:] >= time[:-1]).all()):
-        raise ValueError("Timestamps must be sorted before splitting")
+        raise ValueError("Timestamps must be sorted")
     t_train, t_val = clock_to_seconds(train_end), clock_to_seconds(val_end)
-    if not t_train < t_val:
+    if t_train >= t_val:
         raise ValueError("train_end must come before val_end")
     i_train = int(torch.searchsorted(time, torch.tensor(t_train, dtype=time.dtype)))
     i_val = int(torch.searchsorted(time, torch.tensor(t_val, dtype=time.dtype)))
-    return {
-        "train": slice(0, i_train),
-        "val": slice(i_train, i_val),
-        "test": slice(i_val, len(time)),
-    }
+    return {"train": slice(0, i_train), "val": slice(i_train, i_val), "test": slice(i_val, len(time))}
 
 
 # ---------------------------------------------------------------------------
 # Feature encoding
 #
-# Two encodings of a book snapshot are supported, because the open research
-# question is whether TimeGAN learns the order book constraints by itself:
+# structured  [mid log-return, log spread in ticks, log ask gaps (L-1),
+#              log bid gaps (L-1), log1p ask sizes (L), log1p bid sizes (L)]
+#             The parametrisation keeps the spread positive and the ladder
+#             ordered, up to tick rounding.
+# raw         [mid log-return, ask offsets from mid in ticks (L),
+#              bid offsets from mid in ticks (L), log1p sizes (2L)]
+#             Nothing stops crossed books or broken ladders, so any validity
+#             the model shows here is learned.
 #
-#   "structured"  [mid log-return, log spread ticks, log ask gaps (L-1),
-#                  log bid gaps (L-1), log1p ask sizes (L), log1p bid sizes (L)]
-#                 A positive spread and monotonic ladder are built into the
-#                 parametrisation; after tick rounding a spread or gap can
-#                 still collapse to zero, which the audit reports as a locked
-#                 book or a repeated level.
-#   "raw"         [mid log-return, ask offsets from mid in ticks (L),
-#                  bid offsets from mid in ticks (L), log1p sizes (2L)]
-#                 Nothing prevents crossed books or broken ladders, so any
-#                 validity the model shows here was learned.
+# Feature row j describes book row j + 1. Book row 0 only anchors the first
+# return, so decoding needs the mid-price before the window (prev_mid).
 #
-# Row j of the features describes book row j + 1; book row 0 only anchors the
-# first return, so its mid-price is passed back in when decoding.
-#
-# Optional move flag (move_flag=True) inserts one binary column "mid_moved"
-# right after the log-return: 1 when the mid-price changed by at least one
-# half-tick, 0 when it did not. About half of all real steps have no move, a
-# spike at exactly zero that a generator emitting continuous values almost
-# never hits. With the flag, the model decides "move or not" in its own
-# column and the log-return only sets the size of a move. Decoding keeps the
-# mid on the half-tick grid that real mid-prices always sit on.
+# move_flag=True adds a binary "mid_moved" column after the log-return. About
+# half of the real steps have no mid move, and a generator with continuous
+# outputs almost never lands on exactly zero, so the flag lets the model
+# decide "move or not" separately from the size of the move.
 # ---------------------------------------------------------------------------
 
-REPRESENTATIONS = ("structured", "raw")
-HALF_TICK = TICK / 2            # the smallest possible mid-price move
-
-
 def feature_names(representation: str = "structured", levels: int = 10, move_flag: bool = False) -> list[str]:
-    """Human-readable name of every feature column, in order."""
     if representation == "structured":
         prices = ["log_spread_ticks"]
         prices += [f"log_ask_gap_{k}_{k + 1}" for k in range(1, levels)]
@@ -215,34 +182,33 @@ def feature_names(representation: str = "structured", levels: int = 10, move_fla
         raise ValueError(f"representation must be one of {REPRESENTATIONS}")
     sizes = [f"log1p_ask_size_{k}" for k in range(1, levels + 1)]
     sizes += [f"log1p_bid_size_{k}" for k in range(1, levels + 1)]
-    return ["mid_log_return"] + (["mid_moved"] if move_flag else []) + prices + sizes
+    flag = ["mid_moved"] if move_flag else []
+    return ["mid_log_return"] + flag + prices + sizes
 
 
 def encode_book(book: OrderBook, representation: str = "structured", move_flag: bool = False) -> torch.Tensor:
-    """Encode book rows 1..N-1 as float64 features of shape (N - 1, F)."""
+    """Features of book rows 1..N-1, shape (N - 1, F), float64."""
     mid = book.mid
-    log_return = torch.log(mid[1:]) - torch.log(mid[:-1])
-    returns = [log_return[:, None]]
+    columns = [(torch.log(mid[1:]) - torch.log(mid[:-1]))[:, None]]
     if move_flag:
         moved = torch.round(torch.diff(mid) / HALF_TICK) != 0
-        returns.append(moved.double()[:, None])
+        columns.append(moved.double()[:, None])
     ask, bid = book.ask_price[1:], book.bid_price[1:]
 
     if representation == "structured":
-        # Real prices sit exactly on the tick grid, so rounding only removes
-        # float noise from the division.
-        spread_ticks = torch.round((ask[:, 0] - bid[:, 0]) / TICK)
+        # Real prices are already on the tick grid; rounding only removes float error.
+        spread = torch.round((ask[:, 0] - bid[:, 0]) / TICK)
         ask_gaps = torch.round((ask[:, 1:] - ask[:, :-1]) / TICK)
         bid_gaps = torch.round((bid[:, :-1] - bid[:, 1:]) / TICK)
-        prices = torch.cat([torch.log(spread_ticks)[:, None], torch.log(ask_gaps), torch.log(bid_gaps)], dim=1)
+        columns += [torch.log(spread)[:, None], torch.log(ask_gaps), torch.log(bid_gaps)]
     elif representation == "raw":
         centre = mid[1:, None]
-        prices = torch.cat([(ask - centre) / TICK, (centre - bid) / TICK], dim=1)
+        columns += [(ask - centre) / TICK, (centre - bid) / TICK]
     else:
         raise ValueError(f"representation must be one of {REPRESENTATIONS}")
 
-    sizes = torch.log1p(torch.cat([book.ask_size[1:], book.bid_size[1:]], dim=1))
-    return torch.cat(returns + [prices, sizes], dim=1)
+    columns.append(torch.log1p(torch.cat([book.ask_size[1:], book.bid_size[1:]], dim=1)))
+    return torch.cat(columns, dim=1)
 
 
 def _snap(price: torch.Tensor) -> torch.Tensor:
@@ -250,13 +216,12 @@ def _snap(price: torch.Tensor) -> torch.Tensor:
     return torch.round(price / TICK) * TICK
 
 
-def _flagged_mid_path(log_returns: torch.Tensor, moved: torch.Tensor, prev_mid: float, round_to_tick: bool) -> torch.Tensor:
-    """Mid-price path when a move flag is present.
+def _flagged_mid_path(log_returns: torch.Tensor, moved: torch.Tensor, prev_mid: float,
+                      round_to_tick: bool) -> torch.Tensor:
+    """Mid path for the move-flag encoding.
 
-    A step with moved < 0.5 leaves the mid unchanged. Otherwise the mid moves
-    by the log-return, rounded to whole half-ticks and at least one, so the
-    flag alone decides whether the price changes. The loop is sequential
-    because each step's dollar move depends on the previous mid.
+    The mid only moves on steps with moved >= 0.5, and then by at least one
+    half-tick. It is a loop because each move depends on the previous mid.
     """
     mid, path = float(prev_mid), []
     for r, flag in zip(log_returns.tolist(), moved.tolist()):
@@ -270,16 +235,13 @@ def _flagged_mid_path(log_returns: torch.Tensor, moved: torch.Tensor, prev_mid: 
 
 
 def _parity_spread(spread_ticks: torch.Tensor, mid: torch.Tensor) -> torch.Tensor:
-    """Round spreads to the nearest whole tick count the mid-price allows.
+    """Round spreads to the nearest tick count the mid allows (at least 1).
 
-    The mid is the average of the best bid and ask, both on the 1-cent grid,
-    so a mid on a whole tick needs an even spread and a mid half-way between
-    ticks needs an odd one. Real books always satisfy this. Rounding the
-    spread with the right parity (at least 1 tick) keeps the decoded book's
-    mid exactly on the generated mid path; rounding it freely would shift the
-    book by half a tick and invent price moves on steps flagged as unmoved.
+    Bid and ask sit on the 1-cent grid, so a mid on a whole tick needs an even
+    spread and a mid on a half tick an odd one. Rounding freely would shift
+    the book by half a tick and create mid moves on steps flagged as unmoved.
     """
-    parity = (torch.round(mid / HALF_TICK) % 2).double()       # 0: mid on a whole tick, 1: on a half tick
+    parity = (torch.round(mid / HALF_TICK) % 2).double()     # 1 when the mid is on a half tick
     nearest = 2 * torch.round((spread_ticks - parity) / 2) + parity
     return torch.where(nearest < 1, nearest + 2, nearest)
 
@@ -292,37 +254,31 @@ def decode_book(
     round_to_tick: bool = True,
     move_flag: bool = False,
 ) -> OrderBook:
-    """Invert encode_book for one sequence of shape (T, F).
+    """Inverse of encode_book for one sequence of shape (T, F).
 
-    prev_mid is the mid-price just before the first row; the mid path is
-    rebuilt by compounding the log-returns from it (or, with move_flag, by
-    moving only on flagged steps). No constraint is enforced here: whatever
-    the features imply, including crossed books, negative sizes or repeated
-    levels, is passed through for the audit to count.
+    prev_mid is the mid just before the first row. No constraint is enforced:
+    crossed books, negative sizes and repeated levels are kept for the audit.
     """
     f = features.double()
     if f.dim() != 2 or f.shape[1] != len(feature_names(representation, levels, move_flag)):
         raise ValueError("features must have shape (T, F) for the given representation")
     if move_flag:
         mid = _flagged_mid_path(f[:, 0], f[:, 1], float(prev_mid), round_to_tick)
-        f = torch.cat([f[:, :1], f[:, 2:]], dim=1)     # drop the flag; the rest keeps the usual layout
+        f = torch.cat([f[:, :1], f[:, 2:]], dim=1)     # drop the flag column
     else:
         mid = torch.as_tensor(prev_mid, dtype=torch.float64) * torch.exp(torch.cumsum(f[:, 0], dim=0))
 
     if representation == "structured":
-        spread_ticks = torch.exp(f[:, 1])
+        spread = torch.exp(f[:, 1])
         ask_gaps = torch.exp(f[:, 2:levels + 1])
         bid_gaps = torch.exp(f[:, levels + 1:2 * levels])
         if round_to_tick:
             ask_gaps, bid_gaps = torch.round(ask_gaps), torch.round(bid_gaps)
-            # With the move flag the mid path is authoritative, so the spread is
-            # rounded to a parity that keeps the book's mid exactly on it.
-            # Without the flag, plain rounding is kept for compatibility.
-            spread_ticks = _parity_spread(spread_ticks, mid) if move_flag else torch.round(spread_ticks)
-        best_bid = mid - spread_ticks * TICK / 2
+            spread = _parity_spread(spread, mid) if move_flag else torch.round(spread)
+        best_bid = mid - spread * TICK / 2
         if round_to_tick:
             best_bid = _snap(best_bid)
-        best_ask = best_bid + spread_ticks * TICK
+        best_ask = best_bid + spread * TICK
         zero = torch.zeros_like(mid)[:, None]
         ask_price = best_ask[:, None] + torch.cat([zero, torch.cumsum(ask_gaps, dim=1)], dim=1) * TICK
         bid_price = best_bid[:, None] - torch.cat([zero, torch.cumsum(bid_gaps, dim=1)], dim=1) * TICK
@@ -353,11 +309,8 @@ def decode_book(
 class FeatureScaler:
     """Per-feature scaling fitted on the training period only.
 
-    "minmax" maps each training feature to [0, 1], matching the sigmoid output
-    of the TimeGAN recovery network. "standard" gives zero mean and unit
-    variance. Validation and test data are transformed with the training
-    statistics, so values outside the training range there signal genuine
-    distribution shift rather than being hidden by a refit.
+    "minmax" maps training values to [0, 1], matching the recovery network's
+    sigmoid output; "standard" gives zero mean and unit variance.
     """
 
     METHODS = ("minmax", "standard")
@@ -370,7 +323,7 @@ class FeatureScaler:
         self.shift: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
 
-    def fit(self, x: torch.Tensor) -> "FeatureScaler":
+    def fit(self, x: torch.Tensor) -> FeatureScaler:
         x = x.double()
         if self.method == "minmax":
             self.shift = x.amin(dim=0)
@@ -398,18 +351,17 @@ class FeatureScaler:
         return {"method": self.method, "eps": self.eps, "shift": self.shift, "scale": self.scale}
 
     @classmethod
-    def from_state_dict(cls, state: dict) -> "FeatureScaler":
+    def from_state_dict(cls, state: dict) -> FeatureScaler:
         scaler = cls(state["method"], state["eps"])
         scaler.shift, scaler.scale = state["shift"], state["scale"]
         return scaler
 
 
 class LOBWindowDataset(Dataset):
-    """Fixed-length windows over one contiguous period, served as float32.
+    """Fixed-length float32 windows over one period.
 
-    Windows are slices of a single stored tensor rather than copies, so a
-    stride of 1 costs no extra memory. prev_mid[j] is the mid-price just before
-    feature row j, which decode_book needs to rebuild absolute prices.
+    Windows are views into one tensor, so stride 1 costs no extra memory.
+    prev_mid[j] is the mid-price just before feature row j.
     """
 
     def __init__(self, features: torch.Tensor, prev_mid: torch.Tensor, time: torch.Tensor,
@@ -433,49 +385,40 @@ class LOBWindowDataset(Dataset):
         return self.features[s:s + self.seq_len]
 
     def anchor(self, i: int) -> float:
-        """Mid-price just before window i, for decoding it back to prices."""
+        """Mid-price just before window i."""
         return float(self.prev_mid[int(self.starts[i])])
 
     def window_time(self, i: int) -> torch.Tensor:
-        """Timestamps (seconds after midnight) of the rows in window i."""
         s = int(self.starts[i])
         return self.time[s:s + self.seq_len]
 
     def stack(self, indices: Iterable[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Windows (n, T, F) and their anchor mid-prices (n,) for the given indices (all by default)."""
+        """Windows (n, T, F) and their anchors (n,), all windows by default."""
         idx = list(range(len(self)) if indices is None else indices)
         windows = torch.stack([self[i] for i in idx])
         anchors = torch.tensor([self.anchor(i) for i in idx], dtype=torch.float64)
         return windows, anchors
 
     def disjoint_indices(self) -> range:
-        """Indices of non-overlapping windows spread over the whole period.
-
-        With a training stride of 1 neighbouring windows share almost every
-        row, so reference sets taken from training data step by seq_len.
-        """
+        """Non-overlapping windows, used for reference sets taken from training data."""
         return range(0, len(self), self.seq_len)
 
 
 @dataclass
 class LOBSplits:
-    """Everything train.py and predict.py need from the data side."""
-
     train: LOBWindowDataset
     val: LOBWindowDataset
     test: LOBWindowDataset
     scaler: FeatureScaler
     feature_names: list[str]
-    config: dict
+    config: dict          # the build_datasets arguments
 
     @property
     def representation(self) -> str:
-        """The feature encoding, "structured" or "raw"."""
         return self.config["representation"]
 
     @property
     def move_flag(self) -> bool:
-        """Whether the encoding carries the binary mid-moved column."""
         return self.config["move_flag"]
 
 
@@ -493,13 +436,12 @@ def build_datasets(
     eval_stride: int | None = None,
     move_flag: bool = False,
 ) -> LOBSplits:
-    """Run the full pipeline: load, trim, subsample, encode, split, scale, window.
+    """Run the whole pipeline and return the three windowed periods.
 
-    Features are encoded over the whole trimmed session before splitting. Each
-    feature only looks back one step, so the first validation row's return uses
-    the last training mid-price, which is past information, not look-ahead.
-    The scaler sees training rows only. Evaluation windows default to
-    non-overlapping (eval_stride = seq_len) so each one is a distinct sample.
+    Encoding happens before the split. Each feature only looks one step back,
+    so the first validation return uses the last training mid, which is past
+    data. The scaler sees training rows only, and evaluation windows do not
+    overlap by default (eval_stride = seq_len).
     """
     config = dict(locals())
     config["data_dir"] = str(data_dir)
