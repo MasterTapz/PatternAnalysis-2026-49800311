@@ -9,6 +9,8 @@ For every run given with --run this script:
        KL divergence     spreads (ticks) and mid moves (half-ticks), target <= 0.1
        SSIM              depth heatmaps (20 levels x time, log volume), target > 0.6
        volatility        autocorrelation of squared returns, lags 1 to 20
+       price path        share of steps where the mid does not move, and how far
+                         the mid wanders from its starting value within a window
        diversity         spread of samples and distance to the nearest training window
      with the same statistics for real training windows as a reference
   4. saves an autopsy figure of five rule-selected synthetic windows next to
@@ -37,7 +39,7 @@ import torch
 from skimage.metrics import structural_similarity
 
 from dataset import TICK, LOBSplits, OrderBook, build_datasets
-from metrics import book_violations, decode_windows, distribution_report
+from metrics import book_violations, decode_windows, distribution_report, mid_moves
 from train import model_from_state
 
 KL_TARGET, SSIM_TARGET = 0.1, 0.6
@@ -125,6 +127,28 @@ def pooled_acf(x: torch.Tensor, max_lag: int = 20) -> np.ndarray:
     x = x - x.mean()
     var = (x * x).mean()
     return np.array([float((x[:, :-k] * x[:, k:]).mean() / var) for k in range(1, max_lag + 1)])
+
+
+def price_path_stats(books: list[OrderBook]) -> dict[str, float]:
+    """How often the mid stands still and how far it wanders, per set of windows.
+
+    zero_move_share     share of within-window steps whose mid move, rounded
+                        to half-ticks, is zero (real best quotes move in steps
+                        and hold flat; a generator that jitters every step
+                        scores low here)
+    excursion_ticks_*   per window, the largest absolute distance of the mid
+                        from the window's first mid, in ticks; the median and
+                        90th percentile over windows (a generator whose price
+                        paths drift or trend scores high here)
+    Both use the decoded books, so real and synthetic windows are measured the same way.
+    """
+    moves = mid_moves(books)
+    excursion = torch.stack([(b.mid - b.mid[0]).abs().max() / TICK for b in books]).double()
+    return {
+        "zero_move_share": float((moves == 0).double().mean()),
+        "excursion_ticks_median": float(torch.quantile(excursion, 0.5)),   # quantile interpolates; median() would not
+        "excursion_ticks_p90": float(torch.quantile(excursion, 0.9)),
+    }
 
 
 def mean_pairwise_distance(x: torch.Tensor, n: int = 512, seed: int = 0) -> float:
@@ -258,6 +282,8 @@ def audit_run(run_dir: Path, args) -> dict:
         "ssim": ssim_report,
         "acf_squared_returns_lags_1_5_10_20": {k: [float(v[i]) for i in (0, 4, 9, 19)] for k, v in acf.items()},
         "acf_returns_lags_1_3": acf_returns,
+        "price_path": {k: price_path_stats(b)
+                       for k, b in [("real_train", train_books), ("real_test", real_books), ("synthetic", fake_books)]},
         "diversity_rms": {"synthetic": mean_pairwise_distance(fake_x), "real_test": mean_pairwise_distance(test_x)},
         "nearest_train_rms_median": {"synthetic": float(nearest_train_distance(fake_x[:512], train_all).median()),
                                      "real_test": float(nearest_train_distance(test_x, train_all).median())},
@@ -303,28 +329,46 @@ def print_summary(s: dict) -> None:
     print(f"  SSIM nearest       {ss['nearest']:.3f}  (real reference {ss['nearest_real_reference']:.3f})")
     print(f"  ACF of r^2 lag 1/5/10/20   real train {np.round(a['real_train'], 3).tolist()}   real test "
           f"{np.round(a['real_test'], 3).tolist()}   synthetic {np.round(a['synthetic'], 3).tolist()}")
-    print(f"  diversity (RMS)    synthetic {s['diversity_rms']['synthetic']:.4f}  real {s['diversity_rms']['real_test']:.4f}")
+    for name, label in [("real_train", "real train"), ("real_test", "real test"), ("synthetic", "synthetic")]:
+        pp = s["price_path"][name]
+        print(f"  price path {label:10s}  zero-move share {pp['zero_move_share']:.3f}   excursion from first mid "
+              f"median {pp['excursion_ticks_median']:.1f} ticks, 90th percentile {pp['excursion_ticks_p90']:.1f} ticks")
+    print(f"  diversity (RMS)   synthetic {s['diversity_rms']['synthetic']:.4f}  real {s['diversity_rms']['real_test']:.4f}")
     print(f"  nearest training window (median RMS)  synthetic {s['nearest_train_rms_median']['synthetic']:.4f}  "
           f"real test {s['nearest_train_rms_median']['real_test']:.4f}")
 
 
 def write_comparison(summaries: list[dict], out_dir: Path) -> None:
-    """Markdown table and combined autocorrelation plot over several runs."""
+    """Markdown table and combined autocorrelation plot over several runs.
+
+    The price path columns (zero-move share, median and 90th percentile
+    excursion in ticks) describe each run's synthetic windows; the two
+    reference rows give the same numbers for real training and real test windows.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     header = ("| Run | Params | Crossed | Ladder | Spread KL | Return KL | SSIM mean surface | SSIM random | SSIM nearest "
-              "| ACF r² lag 1 | ACF r² lag 10 |\n|---|---|---|---|---|---|---|---|---|---|---|\n")
+              "| ACF r² lag 1 | ACF r² lag 10 | Zero-move share | Excursion median (ticks) | Excursion p90 (ticks) |\n"
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
     acf_key = "acf_squared_returns_lags_1_5_10_20"
+
+    def path_cells(pp: dict) -> str:
+        return f"{pp['zero_move_share']:.3f} | {pp['excursion_ticks_median']:.1f} | {pp['excursion_ticks_p90']:.1f}"
+
     rows = [f"| {s['run']} | {s['parameters']:,} | {s['violations']['crossed_rate']:.3f} | {s['violations']['ladder_rate']:.3f} | "
             f"{s['kl_vs_test']['kl_spread']:.3f} | {s['kl_vs_test']['kl_return']:.3f} | {s['ssim']['mean_surface']:.3f} | "
             f"{s['ssim']['random_pairs']:.3f} | {s['ssim']['nearest']:.3f} | "
-            f"{s[acf_key]['synthetic'][0]:.3f} | {s[acf_key]['synthetic'][2]:.3f} |" for s in summaries]
+            f"{s[acf_key]['synthetic'][0]:.3f} | {s[acf_key]['synthetic'][2]:.3f} | "
+            f"{path_cells(s['price_path']['synthetic'])} |" for s in summaries]
     ref = summaries[0]
     rows.append(f"| real training vs test (reference) | | 0 | 0 | {ref['kl_real_reference']['kl_spread']:.3f} | "
                 f"{ref['kl_real_reference']['kl_return']:.3f} | {ref['ssim']['mean_surface_real_reference']:.3f} | "
                 f"{ref['ssim']['random_pairs_real_reference']:.3f} | {ref['ssim']['nearest_real_reference']:.3f} | "
-                f"{ref[acf_key]['real_train'][0]:.3f} | {ref[acf_key]['real_train'][2]:.3f} |")
-    rows.append(f"| real test hour (ACF only) | | | | | | | | | {ref[acf_key]['real_test'][0]:.3f} | {ref[acf_key]['real_test'][2]:.3f} |")
-    (out_dir / "comparison.md").write_text(header + "\n".join(rows) + "\n")
+                f"{ref[acf_key]['real_train'][0]:.3f} | {ref[acf_key]['real_train'][2]:.3f} | "
+                f"{path_cells(ref['price_path']['real_train'])} |")
+    rows.append(f"| real test hour (ACF and price path only) | | | | | | | | | {ref[acf_key]['real_test'][0]:.3f} | "
+                f"{ref[acf_key]['real_test'][2]:.3f} | {path_cells(ref['price_path']['real_test'])} |")
+    # Written as UTF-8 so the superscript in the header survives on Windows.
+    (out_dir / "comparison.md").write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
     lags = np.arange(1, 21)
@@ -339,7 +383,7 @@ def write_comparison(summaries: list[dict], out_dir: Path) -> None:
     fig.savefig(out_dir / "volatility_acf_comparison.png", dpi=120)
     plt.close(fig)
     print(f"\nComparison written to {out_dir / 'comparison.md'}\n")
-    print((out_dir / "comparison.md").read_text())
+    print((out_dir / "comparison.md").read_text(encoding="utf-8"))
 
 
 def main(argv: list[str] | None = None) -> None:
