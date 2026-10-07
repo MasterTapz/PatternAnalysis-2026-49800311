@@ -54,6 +54,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--scaling", choices=("minmax", "standard"), default="minmax")
     data.add_argument("--seq-len", type=int, default=64)
     data.add_argument("--event-stride", type=int, default=10)
+    data.add_argument("--move-flag", action="store_true",
+                      help="Add a binary mid-moved feature so zero price moves can be generated")
 
     model = p.add_argument_group("model")
     model.add_argument("--model", choices=tuple(MODELS), default="timegan",
@@ -92,18 +94,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """<representation>_<variant>[_paper][_std]_s<seed>, unique for every setting that changes results.
+    """<representation>_<variant>[_paper][_std][_mf]_s<seed>, unique for every setting that changes results.
 
     variant is timegan, nosup (no supervisor), rgan (plain baseline) or rganm
-    (baseline with the moment loss). _paper marks the paper's loss weights and
-    _std marks standard scaling, so these runs never clash with the defaults.
+    (baseline with the moment loss). _paper marks the paper's loss weights,
+    _std standard scaling and _mf the move-flag encoding, so these runs never
+    clash with the defaults.
     """
     if args.model == "rgan":
         variant = "rganm" if args.baseline_moment_weight > 0 else "rgan"
     else:
         variant = "nosup" if args.no_supervisor else "timegan"
-    suffix = ("_paper" if args.paper_weights and args.model == "timegan" else "") + \
-             ("_std" if args.scaling == "standard" else "")
+    suffix = ("_paper" if args.paper_weights and args.model == "timegan" else "")
+    suffix += "_std" if args.scaling == "standard" else ""
+    suffix += "_mf" if getattr(args, "move_flag", False) else ""
     return f"{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
@@ -167,8 +171,9 @@ class Evaluator:
         self.val_x, self.val_anchor = self._stack(splits.val, range(len(splits.val)))
         train_idx = range(0, len(splits.train), splits.train.seq_len)
         train_x, train_anchor = self._stack(splits.train, train_idx)
-        self.val_books = decode_windows(self.val_x, splits.scaler, self.val_anchor, representation)
-        self.train_books = decode_windows(train_x, splits.scaler, train_anchor, representation)
+        self.move_flag = splits.config.get("move_flag", False)
+        self.val_books = decode_windows(self.val_x, splits.scaler, self.val_anchor, representation, self.move_flag)
+        self.train_books = decode_windows(train_x, splits.scaler, train_anchor, representation, self.move_flag)
         self.generator = torch.Generator().manual_seed(seed)
 
     @staticmethod
@@ -192,7 +197,7 @@ class Evaluator:
         """Generate, decode and score synthetic books against validation and training references."""
         fake_x = model.sample(self.n_samples, self.splits.val.seq_len, self.device)
         pick = torch.randint(len(self.val_anchor), (self.n_samples,), generator=self.generator)
-        fake = decode_windows(fake_x, self.splits.scaler, self.val_anchor[pick], self.representation)
+        fake = decode_windows(fake_x, self.splits.scaler, self.val_anchor[pick], self.representation, self.move_flag)
         out = book_violations(fake)
         out.update({f"val_{k}": v for k, v in distribution_report(self.val_books, fake).items() if k.startswith("kl")})
         out.update({f"train_{k}": v for k, v in distribution_report(self.train_books, fake).items() if k.startswith("kl")})
@@ -465,7 +470,8 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, args: argparse.Namespace, n_
 
     evaluator = Evaluator(splits, args.representation, args.device, n_samples, args.seed)
     test_x, test_anchor = Evaluator._stack(splits.test, range(len(splits.test)))
-    test_books = decode_windows(test_x, splits.scaler, test_anchor, args.representation)
+    move_flag = splits.config.get("move_flag", False)
+    test_books = decode_windows(test_x, splits.scaler, test_anchor, args.representation, move_flag)
 
     torch.manual_seed(args.seed + 1)
     if torch.cuda.is_available():
@@ -476,7 +482,7 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, args: argparse.Namespace, n_
         torch.cuda.synchronize()
     sample_seconds = time.time() - start
     pick = torch.randint(len(test_anchor), (n_samples,), generator=torch.Generator().manual_seed(args.seed))
-    fake = decode_windows(fake_x, splits.scaler, test_anchor[pick], args.representation)
+    fake = decode_windows(fake_x, splits.scaler, test_anchor[pick], args.representation, move_flag)
 
     x = test_x.to(args.device)
     report = {
@@ -518,7 +524,8 @@ def main(argv: list[str] | None = None) -> Path:
     torch.manual_seed(args.seed)
 
     splits = build_datasets(args.data_dir, seq_len=args.seq_len, representation=args.representation,
-                            event_stride=args.event_stride, scaling=args.scaling)
+                            event_stride=args.event_stride, scaling=args.scaling,
+                            move_flag=getattr(args, "move_flag", False))
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()

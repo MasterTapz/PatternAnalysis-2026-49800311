@@ -21,16 +21,17 @@ from dataset import TICK, FeatureScaler, OrderBook, decode_book
 
 
 def decode_windows(windows: torch.Tensor, scaler: FeatureScaler, anchors: torch.Tensor,
-                   representation: str) -> list[OrderBook]:
+                   representation: str, move_flag: bool = False) -> list[OrderBook]:
     """Unscale and decode a batch of windows (B, T, F) into B order books.
 
     anchors[i] is the mid-price just before window i. For real windows it is
     their true previous mid; generated windows borrow anchors from real data,
     which only shifts the price level and leaves spreads and returns alone.
+    move_flag must match the encoding the windows were built with.
     """
     features = scaler.inverse_transform(windows.detach().cpu())
     anchors = torch.as_tensor(anchors, dtype=torch.float64)
-    return [decode_book(features[i], anchors[i], representation) for i in range(len(features))]
+    return [decode_book(features[i], anchors[i], representation, move_flag=move_flag) for i in range(len(features))]
 
 
 def book_violations(books: list[OrderBook]) -> dict[str, float]:

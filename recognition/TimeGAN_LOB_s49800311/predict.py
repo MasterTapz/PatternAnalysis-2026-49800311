@@ -240,13 +240,14 @@ def audit_run(run_dir: Path, args) -> dict:
 
     test_x, test_anchor = real_windows(splits.test, range(len(splits.test)))
     train_x, train_anchor = real_windows(splits.train, range(0, len(splits.train), splits.train.seq_len))
-    real_books = decode_windows(test_x, splits.scaler, test_anchor, rep)
-    train_books = decode_windows(train_x, splits.scaler, train_anchor, rep)
+    move_flag = splits.config.get("move_flag", False)
+    real_books = decode_windows(test_x, splits.scaler, test_anchor, rep, move_flag)
+    train_books = decode_windows(train_x, splits.scaler, train_anchor, rep, move_flag)
 
     torch.manual_seed(args.seed)
     fake_x = model.sample(args.n_samples, splits.test.seq_len, args.device).cpu()
     anchors = test_anchor[torch.randint(len(test_anchor), (args.n_samples,), generator=torch.Generator().manual_seed(args.seed))]
-    fake_books = decode_windows(fake_x, splits.scaler, anchors, rep)
+    fake_books = decode_windows(fake_x, splits.scaler, anchors, rep, move_flag)
 
     b = fake_books[0]
     print("Example synthetic book, first step (price $, size shares):")
