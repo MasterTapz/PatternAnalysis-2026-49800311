@@ -16,12 +16,12 @@ samples are decoded back into order books and scored against the validation
 hour and against a reference set of training windows; the checkpoint with the
 lowest validation score is kept as best.pt. The test hour is never touched here.
 
-Examples (from this folder):
-  python train.py --data-dir ../../../../data/LOBSTER
-  python train.py --data-dir ../../../../data/LOBSTER --no-supervisor
-  python train.py --data-dir ../../../../data/LOBSTER --model rgan
-  python train.py --data-dir ../../../../data/LOBSTER --representation raw
-  python train.py --data-dir ../../../../data/LOBSTER --run-name structured_s0 --resume
+Examples (from the project folder, the one holding src/):
+  python src/train.py --data-dir ../../../../data/LOBSTER
+  python src/train.py --data-dir ../../../../data/LOBSTER --no-supervisor
+  python src/train.py --data-dir ../../../../data/LOBSTER --model rgan
+  python src/train.py --data-dir ../../../../data/LOBSTER --representation raw
+  python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_s0 --resume
 """
 from __future__ import annotations
 

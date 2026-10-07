@@ -20,9 +20,9 @@ With several runs, it also writes a comparison table and a combined
 autocorrelation plot. NumPy and scikit-image are used here for SSIM and plots,
 which the spec allows in predict.py.
 
-Example (from this folder):
-  python predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0
-  python predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0 runs/structured_rgan_s0
+Example (from the project folder, the one holding src/):
+  python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0
+  python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0 runs/structured_rgan_s0
 """
 from __future__ import annotations
 

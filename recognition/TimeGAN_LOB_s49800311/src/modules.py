@@ -609,7 +609,7 @@ class RecurrentGAN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Smoke test: python modules.py [--data-dir ../../../../data/LOBSTER]
+# Smoke test: python src/modules.py [--data-dir ../../../../data/LOBSTER]
 # ---------------------------------------------------------------------------
 
 def _load_batch(data_dir: str | None, batch_size: int, seq_len: int, feature_dim: int, seed: int) -> torch.Tensor:
