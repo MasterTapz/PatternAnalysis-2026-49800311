@@ -1,18 +1,9 @@
-"""Microstructure validity and distribution metrics for real and generated books.
+"""Validity and distribution metrics on decoded order books (PyTorch only).
 
-Shared by train.py (to track progress on the validation hour) and predict.py
-(for the final audit). Every metric works on decoded books in dollars and
-shares, so real and synthetic windows go through exactly the same code path.
-PyTorch only.
-
-Histogram units follow the market's own grid instead of arbitrary bins:
-  * spreads are counted in whole ticks (1 tick = 0.01 dollars), with one extra
-    bin at 0 that collects locked and crossed books (best bid >= best ask);
-  * mid-price moves are counted in half-ticks, the smallest step the mid can
-    take, so the return histogram has one bin per possible move size.
-Log-returns at this scale are proportional to these moves (a half-tick move
-is a log-return of about 2.3e-5 at 220 dollars), so the binning is a
-resolution choice for the returns distribution, not a different quantity.
+Real and synthetic windows go through the same decoding and the same
+metrics. Histograms use the market's own grid: spreads in whole ticks, with
+bin 0 collecting locked and crossed books, and mid moves in half-ticks, the
+smallest step the mid can take.
 """
 from __future__ import annotations
 
@@ -22,30 +13,29 @@ import torch
 
 from dataset import HALF_TICK, TICK, FeatureScaler, LOBSplits, LOBWindowDataset, OrderBook, decode_book
 
-KL_TARGET = 0.1   # spec target for KL(real || synthetic) of spreads and mid-price returns
+KL_TARGET = 0.1   # spec target for KL(real || synthetic) of spreads and returns
 
 
 # ---------------------------------------------------------------------------
-# From scaled windows to order books
+# Scaled windows to order books
 # ---------------------------------------------------------------------------
 
 def decode_windows(windows: torch.Tensor, scaler: FeatureScaler, anchors: torch.Tensor,
                    representation: str, move_flag: bool = False) -> list[OrderBook]:
-    """Unscale and decode a batch of windows (B, T, F) into B order books.
+    """Unscale and decode windows (B, T, F) into B books.
 
-    anchors[i] is the mid-price just before window i. For real windows it is
-    their true previous mid; generated windows borrow anchors from real data,
-    which only shifts the price level and leaves spreads and returns alone.
-    move_flag must match the encoding the windows were built with.
+    anchors[i] is the mid-price before window i. Synthetic windows borrow
+    real anchors, which only shifts the price level.
     """
     features = scaler.inverse_transform(windows.detach().cpu())
     anchors = torch.as_tensor(anchors, dtype=torch.float64)
-    return [decode_book(features[i], anchors[i], representation, move_flag=move_flag) for i in range(len(features))]
+    return [decode_book(features[i], anchors[i], representation, move_flag=move_flag)
+            for i in range(len(features))]
 
 
-def decode_real_windows(splits: LOBSplits, dataset: LOBWindowDataset,
-                        indices: Iterable[int] | None = None) -> tuple[torch.Tensor, torch.Tensor, list[OrderBook]]:
-    """Real windows (n, T, F), their true anchors (n,) and the decoded books, all windows by default."""
+def decode_real_windows(splits: LOBSplits, dataset: LOBWindowDataset, indices: Iterable[int] | None = None,
+                        ) -> tuple[torch.Tensor, torch.Tensor, list[OrderBook]]:
+    """Real windows (n, T, F), their anchors (n,) and the decoded books."""
     windows, anchors = dataset.stack(indices)
     books = decode_windows(windows, splits.scaler, anchors, splits.representation, splits.move_flag)
     return windows, anchors, books
@@ -53,35 +43,33 @@ def decode_real_windows(splits: LOBSplits, dataset: LOBWindowDataset,
 
 def decode_synthetic_windows(splits: LOBSplits, windows: torch.Tensor, real_anchors: torch.Tensor,
                              generator: torch.Generator) -> list[OrderBook]:
-    """Decode generated windows, each anchored at a real anchor drawn at random with generator."""
+    """Decode generated windows, each at a randomly drawn real anchor."""
     pick = torch.randint(len(real_anchors), (len(windows),), generator=generator)
     return decode_windows(windows, splits.scaler, real_anchors[pick], splits.representation, splits.move_flag)
 
 
 # ---------------------------------------------------------------------------
-# Validity and distribution metrics
+# Validity
 # ---------------------------------------------------------------------------
 
 def step_violations(book: OrderBook) -> dict[str, torch.Tensor]:
-    """Boolean masks (T,) marking the steps of one book that break each invariant.
+    """Boolean masks (T,) of the steps that break each rule.
 
-    crossed      best bid >= best ask (locked or crossed, an arbitrage)
-    ladder       ask prices not strictly rising or bid prices not strictly
-                 falling across the 10 levels
-    negative     any quoted size below zero
+    crossed   best bid >= best ask
+    ladder    ask prices not strictly rising or bid prices not strictly falling
+    negative  any size below zero
     """
+    ask_ladder_broken = (book.ask_price.diff(dim=1) <= 0).any(dim=1)
+    bid_ladder_broken = (book.bid_price.diff(dim=1) >= 0).any(dim=1)
     return {
         "crossed": book.bid_price[:, 0] >= book.ask_price[:, 0],
-        "ladder": (book.ask_price.diff(dim=1) <= 0).any(dim=1) | (book.bid_price.diff(dim=1) >= 0).any(dim=1),
+        "ladder": ask_ladder_broken | bid_ladder_broken,
         "negative": (book.ask_size < 0).any(dim=1) | (book.bid_size < 0).any(dim=1),
     }
 
 
 def book_violations(books: list[OrderBook]) -> dict[str, float]:
-    """Share of time steps that break each order book invariant (see step_violations).
-
-    any_violation_rate counts the steps that break at least one of them.
-    """
+    """Share of steps breaking each rule, and any rule."""
     masks = [step_violations(b) for b in books]
     crossed, ladder, negative = (torch.cat([m[kind] for m in masks]) for kind in ("crossed", "ladder", "negative"))
     return {
@@ -92,23 +80,26 @@ def book_violations(books: list[OrderBook]) -> dict[str, float]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Distributions
+# ---------------------------------------------------------------------------
+
 def spread_ticks(books: list[OrderBook]) -> torch.Tensor:
-    """Best ask minus best bid in whole ticks, every time step of every book."""
+    """Spread in whole ticks at every step of every book."""
     return torch.cat([torch.round(b.spread / TICK) for b in books]).long()
 
 
 def mid_moves(books: list[OrderBook]) -> torch.Tensor:
-    """Step-to-step mid-price changes in half-ticks, within each book only."""
+    """Step-to-step mid changes in half-ticks, within each book."""
     return torch.cat([torch.round(b.mid.diff() / HALF_TICK) for b in books]).long()
 
 
 def histogram_kl(p_values: torch.Tensor, q_values: torch.Tensor, low: int, high: int,
                  eps: float = 1e-6) -> float:
-    """KL(P || Q) between two integer samples on the bins low..high.
+    """KL(P || Q) of two integer samples over the bins low..high.
 
-    Values outside the range are clipped into the end bins, so tail mass is
-    kept rather than dropped. eps is added to every bin before normalising,
-    which keeps the divergence finite when Q has an empty bin that P uses.
+    Values outside the range go into the end bins. eps keeps the result
+    finite when Q has an empty bin that P uses.
     """
     def distribution(values: torch.Tensor) -> torch.Tensor:
         counts = torch.bincount(values.clamp(low, high) - low, minlength=high - low + 1).double()
@@ -120,14 +111,11 @@ def histogram_kl(p_values: torch.Tensor, q_values: torch.Tensor, low: int, high:
 
 
 def distribution_report(real: list[OrderBook], fake: list[OrderBook]) -> dict[str, float]:
-    """KL divergences of spreads and mid-price moves, in both directions.
+    """KL of spreads and mid moves in both directions.
 
-    KL(real || synthetic) is the headline number for the spec target of 0.1;
-    it penalises synthetic data that misses real behaviour. KL(synthetic ||
-    real) penalises synthetic mass where real data has none, such as crossed
-    books, so both are reported. Bin ranges come from the real data: spreads
-    from 0 (locked or crossed) to the 99.5th percentile, moves symmetric to
-    the 99.5th percentile of their absolute size.
+    KL(real || synthetic) is the spec's number; the reverse direction also
+    punishes synthetic mass where real data has none. Bin ranges run up to the
+    real 99.5th percentile.
     """
     real_spread, fake_spread = spread_ticks(real), spread_ticks(fake)
     real_move, fake_move = mid_moves(real), mid_moves(fake)
@@ -144,5 +132,5 @@ def distribution_report(real: list[OrderBook], fake: list[OrderBook]) -> dict[st
 
 
 def kl_only(report: dict[str, float]) -> dict[str, float]:
-    """The four KL entries of a distribution_report, without the bin counts."""
+    """The four KL entries of a distribution_report."""
     return {k: v for k, v in report.items() if k.startswith("kl")}

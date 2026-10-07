@@ -1,4 +1,4 @@
-"""Every figure the project draws: training curves, heatmap autopsies, volatility clustering and the README assets."""
+"""Training curves, heatmap autopsies, volatility plots and the README figures."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")   # write image files only; no display is needed, e.g. on a cluster node
+matplotlib.use("Agg")   # files only, no display needed
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -20,41 +20,48 @@ from helpers.metrics import KL_TARGET, step_violations
 # Training
 # ---------------------------------------------------------------------------
 
-def plot_history(history: dict, path: Path, kl_target: float = KL_TARGET) -> None:
-    """Save one figure with the curves of every phase.
+# (title, phase, [(history kind, key, label)], log y-axis)
+HISTORY_PANELS = [
+    ("Phase 1: reconstruction MSE", "autoencoder",
+     [("train", "recon_mse", "train"), ("val", "val_recon_mse", "validation")], True),
+    ("Phase 2: supervised MSE", "supervisor",
+     [("train", "supervised_mse", "train"), ("val", "val_supervised_mse", "validation")], True),
+    ("Phase 3: generator terms", "joint",
+     [("train", "g_adv", "adversarial"), ("train", "g_adv_e", "adversarial, raw path"),
+      ("train", "g_moment", "moment"), ("train", "g_supervised_mse", "supervised MSE")], True),
+    ("Phase 3: discriminator", "joint",
+     [("train", "d_real", "real BCE"), ("train", "d_fake", "fake BCE"),
+      ("train", "d_updated", "share of steps updated")], False),
+    ("Phase 3: gradient norms", "joint",
+     [("train", "g_grad_norm", "generator"), ("train", "d_grad_norm", "discriminator")], True),
+    ("Phase 3: autoencoder on validation", "joint",
+     [("train", "e_recon_mse", "train"), ("val", "val_recon_mse", "validation")], True),
+    ("Phase 3: KL to validation hour", "joint",
+     [("val", "val_kl_spread", "spread"), ("val", "val_kl_return", "return")], True),
+    ("Phase 3: invalid books", "joint",
+     [("val", "crossed_rate", "crossed or locked"), ("val", "ladder_rate", "ladder"),
+      ("val", "negative_size_rate", "negative size")], False),
+]
 
-    Each phase keeps its own step counter, so each panel has its own x-axis.
-    Validation KL panels show the spec target of 0.1 as a dashed line.
-    """
+
+def plot_history(history: dict, path: Path, kl_target: float = KL_TARGET) -> None:
+    """One figure with the curves of every phase; each phase has its own step axis."""
     def series(kind: str, phase: str, key: str):
         rows = [r for r in history[kind] if r["phase"] == phase and key in r]
         return [r["step"] for r in rows], [r[key] for r in rows]
 
-    panels = [
-        ("Phase 1: reconstruction MSE", "autoencoder", [("train", "recon_mse", "train"), ("val", "val_recon_mse", "validation")], True),
-        ("Phase 2: supervised MSE", "supervisor", [("train", "supervised_mse", "train"), ("val", "val_supervised_mse", "validation")], True),
-        ("Phase 3: generator terms", "joint", [("train", "g_adv", "adversarial"), ("train", "g_adv_e", "adversarial, raw path"),
-                                               ("train", "g_moment", "moment"), ("train", "g_supervised_mse", "supervised MSE")], True),
-        ("Phase 3: discriminator", "joint", [("train", "d_real", "real BCE"), ("train", "d_fake", "fake BCE"),
-                                             ("train", "d_updated", "share of steps updated")], False),
-        ("Phase 3: gradient norms", "joint", [("train", "g_grad_norm", "generator"), ("train", "d_grad_norm", "discriminator")], True),
-        ("Phase 3: autoencoder on validation", "joint", [("train", "e_recon_mse", "train"), ("val", "val_recon_mse", "validation")], True),
-        ("Phase 3: KL to validation hour", "joint", [("val", "val_kl_spread", "spread"), ("val", "val_kl_return", "return")], True),
-        ("Phase 3: invalid books", "joint", [("val", "crossed_rate", "crossed or locked"), ("val", "ladder_rate", "ladder"),
-                                             ("val", "negative_size_rate", "negative size")], False),
-    ]
     fig, axes = plt.subplots(2, 4, figsize=(20, 8.5))
-    for ax, (title, phase, lines, log_y) in zip(axes.flat, panels):
-        drawn, plotted_values = False, []
+    for ax, (title, phase, lines, log_y) in zip(axes.flat, HISTORY_PANELS):
+        values = []
         for kind, key, label in lines:
             x, y = series(kind, phase, key)
             if x:
                 ax.plot(x, y, marker="o" if kind == "val" else None, markersize=3, label=label)
-                plotted_values += y
-                drawn = True
+                values += y
+        drawn = bool(values)
         if "KL" in title:
             ax.axhline(kl_target, color="grey", linestyle="--", linewidth=1, label=f"target {kl_target}")
-        if drawn and log_y and all(v > 0 for v in plotted_values):   # log axis only when every value is positive
+        if drawn and log_y and all(v > 0 for v in values):
             ax.set_yscale("log")
         ax.set_title(title if drawn else f"{title} (not run)")
         ax.set_xlabel("step in phase")
@@ -72,19 +79,19 @@ def plot_history(history: dict, path: Path, kl_target: float = KL_TARGET) -> Non
 
 def plot_autopsy(cases: list[tuple[str, int]], fake_books: list[OrderBook], real_books: list[OrderBook],
                  nearest: np.ndarray, data_range: float, title: str, path: Path) -> None:
-    """One row per case: real depth, synthetic depth, difference, and best quotes over time.
+    """One row per case: real depth, synthetic depth, their difference and the best quotes.
 
-    nearest is the (n_real, n_fake) SSIM matrix; each synthetic window is shown
-    next to the real test window it matches best.
+    Each synthetic window is shown next to the real test window it matches
+    best in nearest, the (n_real, n_fake) SSIM matrix.
     """
     fig, axes = plt.subplots(len(cases), 4, figsize=(19, 3.1 * len(cases)), squeeze=False)
+    heatmap = dict(aspect="auto", origin="lower", cmap="viridis", vmin=0, vmax=data_range)
     for row, (label, j) in enumerate(cases):
         r = int(np.argmax(nearest[:, j]))
         real_img, fake_img = depth_image(real_books[r]), depth_image(fake_books[j])
-        kwargs = dict(aspect="auto", origin="lower", cmap="viridis", vmin=0, vmax=data_range)
-        axes[row, 0].imshow(real_img, **kwargs)
+        axes[row, 0].imshow(real_img, **heatmap)
         axes[row, 0].set_title(f"{label}: closest real test window")
-        im = axes[row, 1].imshow(fake_img, **kwargs)
+        im = axes[row, 1].imshow(fake_img, **heatmap)
         axes[row, 1].set_title(f"synthetic, SSIM {nearest[r, j]:.2f}")
         diff = axes[row, 2].imshow(fake_img - real_img, aspect="auto", origin="lower", cmap="RdBu_r",
                                    vmin=-data_range / 2, vmax=data_range / 2)
@@ -96,13 +103,13 @@ def plot_autopsy(cases: list[tuple[str, int]], fake_books: list[OrderBook], real
         fig.colorbar(diff, ax=axes[row, 2], fraction=0.04)
         _plot_best_quotes(axes[row, 3], real_books[r], fake_books[j])
     fig.suptitle(title)
-    fig.tight_layout(rect=(0, 0, 1, 0.975))   # leave room for the title above the first row
+    fig.tight_layout(rect=(0, 0, 1, 0.975))   # room for the title
     fig.savefig(path, dpi=110)
     plt.close(fig)
 
 
 def _plot_best_quotes(ax: plt.Axes, real: OrderBook, fake: OrderBook) -> None:
-    """Best bid and ask of a real and a synthetic window in ticks from each one's first mid, invalid steps marked."""
+    """Best bid and ask in ticks from each window's first mid, with invalid synthetic steps marked."""
     for book, style, name in [(real, "--", "real"), (fake, "-", "synthetic")]:
         ref = float(book.mid[0])
         ax.plot((book.ask_price[:, 0] - ref) / TICK, style, color="tab:red", label=f"{name} best ask")
@@ -117,7 +124,7 @@ def _plot_best_quotes(ax: plt.Axes, real: OrderBook, fake: OrderBook) -> None:
 
 
 def plot_volatility_acf(acf: dict[str, np.ndarray], run_name: str, path: Path) -> None:
-    """ACF of squared returns for one run's synthetic windows against both real periods."""
+    """Squared-return ACF of one run against both real periods."""
     fig, ax = plt.subplots(figsize=(7, 4))
     lags = np.arange(1, len(acf["synthetic"]) + 1)
     ax.plot(lags, acf["real_train"], "o-", label="real training hours")
@@ -134,7 +141,7 @@ def plot_volatility_acf(acf: dict[str, np.ndarray], run_name: str, path: Path) -
 
 def plot_volatility_comparison(real_train: np.ndarray, real_test: np.ndarray,
                                synthetic: dict[str, np.ndarray], path: Path) -> None:
-    """ACF of squared returns for several runs (synthetic, keyed by run name) on one set of axes."""
+    """Squared-return ACF of several runs (keyed by run name) on one plot."""
     fig, ax = plt.subplots(figsize=(8, 4.5))
     lags = np.arange(1, len(real_train) + 1)
     ax.plot(lags, real_train, "ko-", linewidth=2, label="real training hours")
@@ -142,7 +149,8 @@ def plot_volatility_comparison(real_train: np.ndarray, real_test: np.ndarray,
     for run_name, curve in synthetic.items():
         ax.plot(lags, curve, label=run_name)
     ax.axhline(0, color="grey", linewidth=0.8)
-    ax.set(xlabel="lag (steps of 10 events)", ylabel="autocorrelation of squared returns", title="Volatility clustering by model")
+    ax.set(xlabel="lag (steps of 10 events)", ylabel="autocorrelation of squared returns",
+           title="Volatility clustering by model")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
@@ -150,10 +158,10 @@ def plot_volatility_comparison(real_train: np.ndarray, real_test: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# README assets
+# README figures
 # ---------------------------------------------------------------------------
 
-# Run outputs the README embeds, copied under clear names: asset name -> path inside the runs folder.
+# README file name -> source inside the runs folder
 README_COPIES = {
     "training_curves_structured_timegan.png": "structured_timegan_s0/training_curves.png",
     "autopsy_structured_timegan.png": "structured_timegan_s0/predict/autopsy.png",
@@ -163,9 +171,8 @@ README_COPIES = {
 }
 LADDER_FIGURE = "ladder_rate_raw_joint_phase.png"
 
-# Raw-encoding runs in the ladder figure: (run folder, legend label, colour, marker, line style).
-# Colours are the first three slots of a colour-blind-checked categorical palette;
-# the markers and line styles differ too, so the series do not rely on colour alone.
+# (run folder, label, colour, marker, line style). Colour-blind safe colours,
+# and markers and line styles differ too, so colour is never the only cue.
 LADDER_RUNS = [
     ("raw_timegan_s0", "TimeGAN", "#2a78d6", "o", "-"),
     ("raw_nosup_s0", "TimeGAN without supervisor", "#eb6834", "s", "--"),
@@ -174,11 +181,9 @@ LADDER_RUNS = [
 
 
 def export_readme_assets(runs_dir: Path, out_dir: Path) -> list[Path]:
-    """Collect the README figures from the run folders into out_dir; returns every PNG there.
+    """Copy the README figures out of the runs folder and draw the ladder figure.
 
-    Copies the run outputs listed in README_COPIES (the originals stay in
-    runs/) and draws one new figure from the raw-encoding runs' history.json
-    files. Only history files and PNGs are read; no model is loaded.
+    Only PNGs and history files are read, no model. Returns every PNG in out_dir.
     """
     out_dir.mkdir(exist_ok=True)
     for name, source in README_COPIES.items():
@@ -188,21 +193,18 @@ def export_readme_assets(runs_dir: Path, out_dir: Path) -> list[Path]:
 
 
 def joint_validation(history_path: Path) -> list[dict]:
-    """Validation records of the joint (adversarial) phase, in step order."""
+    """Joint-phase validation records in step order."""
     history = json.loads(history_path.read_text())
     return sorted((r for r in history["val"] if r["phase"] == "joint"), key=lambda r: r["step"])
 
 
 def best_step(records: list[dict]) -> int:
-    """Step of the checkpoint kept as best.pt: the last record flagged new_best."""
+    """The step kept as best.pt: the last record flagged new_best."""
     return [r["step"] for r in records if r.get("new_best")][-1]
 
 
 def plot_ladder(runs_dir: Path, path: Path) -> None:
-    """Broken-ladder rate and validation spread KL across the joint phase, each run's best.pt step ringed.
-
-    Two panels share the step axis, one per measure.
-    """
+    """Broken-ladder rate and validation spread KL over the joint phase, best.pt ringed."""
     fig, (ax_ladder, ax_kl) = plt.subplots(1, 2, figsize=(11, 4.0), sharex=True)
     for run, label, colour, marker, style in LADDER_RUNS:
         records = joint_validation(runs_dir / run / "history.json")
@@ -210,8 +212,8 @@ def plot_ladder(runs_dir: Path, path: Path) -> None:
         best = best_step(records)
         for ax, key in [(ax_ladder, "ladder_rate"), (ax_kl, "val_kl_spread")]:
             values = [r[key] for r in records]
-            ax.plot(steps, values, linestyle=style, linewidth=2, color=colour, marker=marker, markersize=5, label=label)
-            # Hollow ring on the step kept as best.pt, so the reader sees where model selection stopped.
+            ax.plot(steps, values, linestyle=style, linewidth=2, color=colour, marker=marker, markersize=5,
+                    label=label)
             ax.plot([best], [values[steps.index(best)]], marker="o", markersize=13, markerfacecolor="none",
                     markeredgecolor=colour, markeredgewidth=1.5, linestyle="none")
 
@@ -219,7 +221,7 @@ def plot_ladder(runs_dir: Path, path: Path) -> None:
                   ylabel="share of time steps with a broken ladder", ylim=(0, 1.05))
     ax_kl.axhline(KL_TARGET, color="#6b6b6b", linestyle="--", linewidth=1)
     ax_kl.text(4_300, KL_TARGET - 0.005, f"target {KL_TARGET}", color="#4a4a4a", fontsize=8, ha="left", va="top")
-    # The baseline starts far above the others (3.06 at step 500), so the axis is cut to keep the rest readable.
+    # The baseline starts at 3.06, so the axis is cut to keep the other runs readable.
     ax_kl.set(title="Spread KL against the validation hour (axis cut at 0.45)", xlabel="joint-phase step",
               ylabel="KL(real || synthetic)", ylim=(0, 0.45))
     for ax in (ax_ladder, ax_kl):

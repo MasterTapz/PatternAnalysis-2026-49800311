@@ -1,9 +1,8 @@
-"""Scoring a model on the validation hour during training, and on the test hour afterwards.
+"""Validation scoring during training and the test-hour evaluation afterwards.
 
-Evaluator runs at every validation step of train.py; its score decides which
-checkpoint becomes best.pt, and it only ever sees the 14:00 to 15:00 hour.
-evaluate_test runs once, after training, on best.pt and the held-out test
-hour (15:00 to 15:50), and writes test_metrics.json.
+Evaluator only sees the validation hour (14:00 to 15:00) and its score
+picks best.pt. evaluate_test runs once after training on best.pt and the
+test hour (15:00 to 15:50), and writes test_metrics.json.
 """
 from __future__ import annotations
 
@@ -15,27 +14,27 @@ import torch
 
 from dataset import LOBSplits
 from helpers.checkpoints import PHASES, best_checkpoint, load_checkpoint, model_from_state
-from helpers.metrics import book_violations, decode_real_windows, decode_synthetic_windows, distribution_report, kl_only
+from helpers.metrics import (book_violations, decode_real_windows, decode_synthetic_windows, distribution_report,
+                             kl_only)
 from modules import SequenceGAN, TimeGAN
 
 
 def reconstruction_mse(model: TimeGAN, x: torch.Tensor) -> float:
-    """Mean squared error of the autoencoder r(e(x)) on real windows x (B, T, F)."""
     return float(torch.mean((model.reconstruct(x) - x) ** 2))
 
 
 class Evaluator:
-    """Scores the model on the validation hour; built once per run.
+    """Scores a model on the validation hour.
 
-    The reference books are decoded once: every validation window, and
-    non-overlapping training windows spread over all training hours.
+    The reference books are decoded once: every validation window and
+    non-overlapping training windows from all training hours.
     """
 
     def __init__(self, splits: LOBSplits, device: str, n_samples: int, seed: int):
         self.splits, self.device, self.n_samples = splits, device, n_samples
         self.val_x, self.val_anchor, self.val_books = decode_real_windows(splits, splits.val)
         _, _, self.train_books = decode_real_windows(splits, splits.train, splits.train.disjoint_indices())
-        self.generator = torch.Generator().manual_seed(seed)   # anchors for synthetic windows, separate from training RNG
+        self.generator = torch.Generator().manual_seed(seed)   # for anchors only, separate from training
 
     @torch.no_grad()
     def reconstruction(self, model: SequenceGAN) -> dict[str, float]:
@@ -50,10 +49,9 @@ class Evaluator:
 
     @torch.no_grad()
     def samples(self, model: SequenceGAN) -> dict[str, float]:
-        """Generate, decode and score synthetic books against validation and training references.
+        """Validity and KL of synthetic books against validation and training data.
 
-        score = validation spread KL + validation return KL + any-violation
-        rate; the lowest score so far is kept as best.pt.
+        score = validation spread KL + validation return KL + any-violation rate.
         """
         fake_x = model.sample(self.n_samples, self.splits.val.seq_len, self.device)
         fake = decode_synthetic_windows(self.splits, fake_x, self.val_anchor, self.generator)
@@ -65,7 +63,7 @@ class Evaluator:
 
 
 def timed_sample(model: SequenceGAN, n: int, seq_len: int, device: str) -> tuple[torch.Tensor, float]:
-    """n synthetic windows and the wall-clock seconds it took, waiting for the GPU to finish."""
+    """n synthetic windows and the seconds it took, waiting for the GPU."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start = time.time()
@@ -77,13 +75,11 @@ def timed_sample(model: SequenceGAN, n: int, seq_len: int, device: str) -> tuple
 
 @torch.no_grad()
 def evaluate_test(run_dir: Path, splits: LOBSplits, device: str, seed: int, n_samples: int = 1024) -> dict:
-    """Score the best checkpoint on the held-out test hour (15:00 to 15:50).
+    """Score best.pt on the test hour and write test_metrics.json.
 
-    Reports reconstruction error, invalid-book rates, KL of spreads and moves
-    against the test hour and against the training reference, the same KL for
-    real data alone (the floor any generator is judged against), and the cost
-    of sampling. Sampling uses seed + 1, so these numbers differ slightly from
-    predict.py, which samples with seed.
+    The real-vs-real KL floors are included, since no generator can be
+    expected to beat them. Sampling uses seed + 1, so the numbers differ
+    slightly from predict.py, which uses seed.
     """
     checkpoint = best_checkpoint(run_dir)
     state = load_checkpoint(checkpoint, device)
@@ -115,13 +111,13 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, device: str, seed: int, n_sa
 
 
 def print_test_report(report: dict, n_real: int) -> None:
-    """Console summary of evaluate_test: invalid books and both KLs against each reference."""
     n_samples = report["sampling"]["sequences"]
     print(f"\nTest hour evaluation of {report['checkpoint']} ({n_samples} synthetic windows vs {n_real} real)")
     print(f"  invalid books: {report['violations']}")
-    row = "  {:32s} spread KL {:7.3f}   return KL {:7.3f}"
-    for label, key in [("synthetic vs test hour", "vs_test_hour"), ("synthetic vs training reference", "vs_training_reference"),
-                       ("real floor: training vs test", "real_floor_training_vs_test"),
-                       ("real floor: validation vs test", "real_floor_validation_vs_test")]:
-        print(row.format(label, report[key]["kl_spread"], report[key]["kl_return"]))
+    rows = [("synthetic vs test hour", "vs_test_hour"),
+            ("synthetic vs training reference", "vs_training_reference"),
+            ("real floor: training vs test", "real_floor_training_vs_test"),
+            ("real floor: validation vs test", "real_floor_validation_vs_test")]
+    for label, key in rows:
+        print(f"  {label:32s} spread KL {report[key]['kl_spread']:7.3f}   return KL {report[key]['kl_return']:7.3f}")
     print(f"  sampling: {report['sampling']['sequences_per_second']:.0f} sequences per second")
