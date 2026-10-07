@@ -269,6 +269,21 @@ def _flagged_mid_path(log_returns: torch.Tensor, moved: torch.Tensor, prev_mid: 
     return torch.tensor(path, dtype=torch.float64)
 
 
+def _parity_spread(spread_ticks: torch.Tensor, mid: torch.Tensor) -> torch.Tensor:
+    """Round spreads to the nearest whole tick count the mid-price allows.
+
+    The mid is the average of the best bid and ask, both on the 1-cent grid,
+    so a mid on a whole tick needs an even spread and a mid half-way between
+    ticks needs an odd one. Real books always satisfy this. Rounding the
+    spread with the right parity (at least 1 tick) keeps the decoded book's
+    mid exactly on the generated mid path; rounding it freely would shift the
+    book by half a tick and invent price moves on steps flagged as unmoved.
+    """
+    parity = (torch.round(mid / HALF_TICK) % 2).double()       # 0: mid on a whole tick, 1: on a half tick
+    nearest = 2 * torch.round((spread_ticks - parity) / 2) + parity
+    return torch.where(nearest < 1, nearest + 2, nearest)
+
+
 def decode_book(
     features: torch.Tensor,
     prev_mid: torch.Tensor | float,
@@ -299,7 +314,11 @@ def decode_book(
         ask_gaps = torch.exp(f[:, 2:levels + 1])
         bid_gaps = torch.exp(f[:, levels + 1:2 * levels])
         if round_to_tick:
-            spread_ticks, ask_gaps, bid_gaps = (torch.round(x) for x in (spread_ticks, ask_gaps, bid_gaps))
+            ask_gaps, bid_gaps = torch.round(ask_gaps), torch.round(bid_gaps)
+            # With the move flag the mid path is authoritative, so the spread is
+            # rounded to a parity that keeps the book's mid exactly on it.
+            # Without the flag, plain rounding is kept for compatibility.
+            spread_ticks = _parity_spread(spread_ticks, mid) if move_flag else torch.round(spread_ticks)
         best_bid = mid - spread_ticks * TICK / 2
         if round_to_tick:
             best_bid = _snap(best_bid)
