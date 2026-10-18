@@ -15,7 +15,7 @@ import torch
 from dataset import LOBSplits
 from helpers.checkpoints import PHASES, best_checkpoint, load_checkpoint, model_from_state
 from helpers.metrics import (book_violations, decode_real_windows, decode_synthetic_windows, distribution_report,
-                             kl_only)
+                             kl_only, vwap_report)
 from modules import SequenceGAN, TimeGAN
 
 
@@ -52,12 +52,14 @@ class Evaluator:
         """Validity and KL of synthetic books against validation and training data.
 
         score = validation spread KL + validation return KL + any-violation rate.
+        The VWAP KLs are logged for monitoring only and do not enter the score.
         """
         fake_x = model.sample(self.n_samples, self.splits.val.seq_len, self.device)
         fake = decode_synthetic_windows(self.splits, fake_x, self.val_anchor, self.generator)
         out = book_violations(fake)
         out.update({f"val_{k}": v for k, v in kl_only(distribution_report(self.val_books, fake)).items()})
         out.update({f"train_{k}": v for k, v in kl_only(distribution_report(self.train_books, fake)).items()})
+        out.update({f"val_{k}": v for k, v in vwap_report(self.val_books, fake).items()})
         out["score"] = out["val_kl_spread"] + out["val_kl_return"] + out["any_violation_rate"]
         return out
 

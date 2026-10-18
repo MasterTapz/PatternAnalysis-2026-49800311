@@ -29,7 +29,7 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>]_s<seed>.
+    """<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>]_s<seed>.
 
     variant is timegan, nosup (no supervisor), rgan (plain baseline) or
     rganm (baseline with the moment loss). Every option that changes the
@@ -44,6 +44,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix += "_mf" if args.move_flag else ""
     suffix += "_ema" if args.ema_decay > 0 else ""
     suffix += f"_sn{args.static_noise_dim}" if args.static_noise_dim > 0 and args.model == "timegan" else ""
+    suffix += f"_dw{args.difference_weight:g}" if args.difference_weight > 0 and args.model == "timegan" else ""
     return f"{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
@@ -62,6 +63,7 @@ def build_model(args: argparse.Namespace, feature_dim: int) -> SequenceGAN:
         recovery_activation=activation,
         use_supervisor=not args.no_supervisor,
         static_noise_dim=args.static_noise_dim,
+        difference_weight=args.difference_weight,
         **(paper if args.paper_weights else {}),
     ))
 
