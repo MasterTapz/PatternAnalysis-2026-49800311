@@ -134,3 +134,64 @@ def distribution_report(real: list[OrderBook], fake: list[OrderBook]) -> dict[st
 def kl_only(report: dict[str, float]) -> dict[str, float]:
     """The four KL entries of a distribution_report."""
     return {k: v for k, v in report.items() if k.startswith("kl")}
+
+
+# ---------------------------------------------------------------------------
+# VWAP
+# ---------------------------------------------------------------------------
+#
+# The VWAP of one side is sum(price * size) / sum(size) over its 10 levels,
+# so it moves with the quotes and with depth shifting between levels.
+# Synthetic windows sit at a borrowed real anchor, so the dollar level of the
+# VWAP says nothing; everything here is relative to the book's own mid or a
+# change from one step to the next, both in ticks.
+
+VWAP_BINS = 50   # equal-width bins between the real 0.5th and 99.5th percentiles
+
+
+def side_vwap(price: torch.Tensor, size: torch.Tensor) -> torch.Tensor:
+    """VWAP over the levels of one side, shape (T,); negative sizes count as zero."""
+    weight = size.clamp_min(0)
+    return (price * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1e-9)
+
+
+def vwap_depth(books: list[OrderBook]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distance from the mid to the bid VWAP and to the ask VWAP, in ticks, each (n_books, T)."""
+    bid = torch.stack([(b.mid - side_vwap(b.bid_price, b.bid_size)) / TICK for b in books])
+    ask = torch.stack([(side_vwap(b.ask_price, b.ask_size) - b.mid) / TICK for b in books])
+    return bid, ask
+
+
+def vwap_changes(books: list[OrderBook]) -> torch.Tensor:
+    """Step-to-step changes of the bid and ask VWAP in ticks, shape (2 * n_books, T - 1).
+
+    Rows are bid series then ask series, each within one window.
+    """
+    bid = torch.stack([side_vwap(b.bid_price, b.bid_size).diff() / TICK for b in books])
+    ask = torch.stack([side_vwap(b.ask_price, b.ask_size).diff() / TICK for b in books])
+    return torch.cat([bid, ask])
+
+
+def binned_kl(real: torch.Tensor, fake: torch.Tensor, bins: int = VWAP_BINS) -> tuple[float, float]:
+    """KL(real || fake) and KL(fake || real) of two continuous samples.
+
+    The bins span the real 0.5th to 99.5th percentiles and values outside go
+    into the end bins, as in histogram_kl.
+    """
+    real, fake = real.flatten().double(), fake.flatten().double()
+    low, high = torch.quantile(real, torch.tensor([0.005, 0.995], dtype=torch.float64))
+    inner_edges = torch.linspace(float(low), float(high), bins + 1, dtype=torch.float64)[1:-1]
+    p, q = torch.bucketize(real, inner_edges), torch.bucketize(fake, inner_edges)
+    return histogram_kl(p, q, 0, bins - 1), histogram_kl(q, p, 0, bins - 1)
+
+
+def vwap_report(real: list[OrderBook], fake: list[OrderBook]) -> dict[str, float]:
+    """KL of the VWAP distance from the mid (bid and ask pooled) and of the VWAP changes."""
+    depth_kl, depth_kl_reverse = binned_kl(torch.cat(vwap_depth(real)), torch.cat(vwap_depth(fake)))
+    change_kl, change_kl_reverse = binned_kl(vwap_changes(real), vwap_changes(fake))
+    return {
+        "kl_vwap_depth": depth_kl,
+        "kl_vwap_change": change_kl,
+        "kl_vwap_depth_reverse": depth_kl_reverse,
+        "kl_vwap_change_reverse": change_kl_reverse,
+    }
