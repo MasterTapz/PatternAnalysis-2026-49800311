@@ -188,6 +188,25 @@ def difference_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return std_term + abs_term
 
 
+def change_correlation(x: torch.Tensor) -> torch.Tensor:
+    """(F, F) correlation matrix of the step changes x[t] - x[t-1], pooled over batch and steps."""
+    d = x.diff(dim=1).flatten(0, 1)
+    d = d - d.mean(dim=0)
+    d = d / torch.sqrt(d.pow(2).mean(dim=0) + 1e-6)
+    return d.T @ d / d.shape[0]
+
+
+def change_correlation_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """L_C: mean absolute gap between the correlation matrices of step changes.
+
+    Real levels move together: when the best quote moves, the queues shift
+    one level and neighbouring gaps change in opposite directions, so deep
+    prices barely move. L_D only matches each feature on its own and leaves
+    these changes independent.
+    """
+    return (change_correlation(x_hat) - change_correlation(x)).abs().mean()
+
+
 # ---------------------------------------------------------------------------
 # Shared interface
 # ---------------------------------------------------------------------------
@@ -260,7 +279,7 @@ class TimeGANConfig:
     The discriminator is skipped when its loss is below d_threshold.
     static_noise_dim adds noise channels held constant per window (0 = paper).
     difference_weight > 0 adds L_D on step changes to the generator loss
-    (0 = paper).
+    and change_corr_weight > 0 adds L_C on their correlations (0 = paper).
     """
 
     feature_dim: int
@@ -276,6 +295,7 @@ class TimeGANConfig:
     eta: float = 100.0
     moment_weight: float = 100.0
     difference_weight: float = 0.0
+    change_corr_weight: float = 0.0
     recon_weight: float = 10.0
     embed_supervised_weight: float = 0.1
     sqrt_losses: bool = True
@@ -387,9 +407,10 @@ class TimeGAN(SequenceGAN):
             L_S    supervised loss on real codes, weight eta
             L_V    moment loss on decoded features, weight moment_weight
             L_D    step-change loss on decoded features, weight difference_weight
+            L_C    step-change correlation loss, weight change_corr_weight
 
         The recovery and discriminator are frozen, so gradients pass through
-        them without changing them. L_D is logged even when its weight is 0.
+        them without changing them. L_D and L_C are logged even at weight 0.
         """
         c = self.config
         if z is None:
@@ -404,11 +425,14 @@ class TimeGAN(SequenceGAN):
             adv_e = adversarial_bce(self.discriminator(e_hat), real=True)
         moments = moment_loss(x_hat, x)
         differences = difference_loss(x_hat, x)
+        correlations = change_correlation_loss(x_hat, x)
         loss = adv + c.gamma * adv_e + c.moment_weight * moments
         if c.difference_weight > 0:
             loss = loss + c.difference_weight * differences
+        if c.change_corr_weight > 0:
+            loss = loss + c.change_corr_weight * correlations
         logs = {"adv": adv.detach(), "adv_e": adv_e.detach(), "moment": moments.detach(),
-                "difference": differences.detach()}
+                "difference": differences.detach(), "change_corr": correlations.detach()}
         if self.supervisor is not None:
             supervised = self._supervised_mse(h)
             loss = loss + c.eta * self._root(supervised)
