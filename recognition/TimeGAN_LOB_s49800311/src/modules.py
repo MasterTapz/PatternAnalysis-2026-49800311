@@ -172,6 +172,22 @@ def moment_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return std_term + mean_term
 
 
+def difference_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """L_D: gap in the std and the mean absolute value of step changes, per feature.
+
+    Changes are x[t] - x[t-1], pooled over the batch and every step. Real
+    books leave most levels alone and then jump, so their changes are
+    sparse; matching the mean absolute change as well as the std rules out
+    the alternative of small noise at every step.
+    """
+    d_hat, d = x_hat.diff(dim=1), x.diff(dim=1)
+    std_hat = torch.sqrt(d_hat.var(dim=(0, 1), correction=0) + 1e-6)
+    std_real = torch.sqrt(d.var(dim=(0, 1), correction=0) + 1e-6)
+    std_term = (std_hat - std_real).abs().mean()
+    abs_term = (d_hat.abs().mean(dim=(0, 1)) - d.abs().mean(dim=(0, 1))).abs().mean()
+    return std_term + abs_term
+
+
 # ---------------------------------------------------------------------------
 # Shared interface
 # ---------------------------------------------------------------------------
@@ -243,6 +259,8 @@ class TimeGANConfig:
     its place), no L_S terms and no phase 2, with everything else unchanged.
     The discriminator is skipped when its loss is below d_threshold.
     static_noise_dim adds noise channels held constant per window (0 = paper).
+    difference_weight > 0 adds L_D on step changes to the generator loss
+    (0 = paper).
     """
 
     feature_dim: int
@@ -257,6 +275,7 @@ class TimeGANConfig:
     gamma: float = 1.0
     eta: float = 100.0
     moment_weight: float = 100.0
+    difference_weight: float = 0.0
     recon_weight: float = 10.0
     embed_supervised_weight: float = 0.1
     sqrt_losses: bool = True
@@ -367,9 +386,10 @@ class TimeGAN(SequenceGAN):
             L_U_e  adversarial loss on e_hat = generator(z), weight gamma
             L_S    supervised loss on real codes, weight eta
             L_V    moment loss on decoded features, weight moment_weight
+            L_D    step-change loss on decoded features, weight difference_weight
 
         The recovery and discriminator are frozen, so gradients pass through
-        them without changing them.
+        them without changing them. L_D is logged even when its weight is 0.
         """
         c = self.config
         if z is None:
@@ -383,8 +403,12 @@ class TimeGAN(SequenceGAN):
             adv = adversarial_bce(self.discriminator(h_hat), real=True)
             adv_e = adversarial_bce(self.discriminator(e_hat), real=True)
         moments = moment_loss(x_hat, x)
+        differences = difference_loss(x_hat, x)
         loss = adv + c.gamma * adv_e + c.moment_weight * moments
-        logs = {"adv": adv.detach(), "adv_e": adv_e.detach(), "moment": moments.detach()}
+        if c.difference_weight > 0:
+            loss = loss + c.difference_weight * differences
+        logs = {"adv": adv.detach(), "adv_e": adv_e.detach(), "moment": moments.detach(),
+                "difference": differences.detach()}
         if self.supervisor is not None:
             supervised = self._supervised_mse(h)
             loss = loss + c.eta * self._root(supervised)
