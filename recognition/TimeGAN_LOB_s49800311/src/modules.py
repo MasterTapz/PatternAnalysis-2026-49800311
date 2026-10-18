@@ -128,6 +128,38 @@ class Discriminator(RecurrentBlock):
         super().__init__(hidden_dim, hidden_dim, 1, num_layers, rnn_type, "identity", bidirectional)
 
 
+class LadderTicks(nn.Module):
+    """Scaled structured features (B, T, F) -> ladder and VWAP distances in ticks (B, T, 2L).
+
+    Undoes the min-max scaling, turns the log gaps into each level's distance
+    from the best quote of its side (levels 2 to L) and adds the size-weighted
+    mean distance (the side's VWAP minus its best quote). No rounding, so it
+    stays differentiable. Its tensors are not saved in checkpoints; the
+    decoder is only needed for training.
+    """
+
+    def __init__(self, shift: torch.Tensor, scale: torch.Tensor, ask_gaps: list[int], bid_gaps: list[int],
+                 ask_sizes: list[int], bid_sizes: list[int]):
+        super().__init__()
+        self.register_buffer("shift", shift.float(), persistent=False)
+        self.register_buffer("scale", scale.float(), persistent=False)
+        self.columns = {"ask_gaps": ask_gaps, "bid_gaps": bid_gaps, "ask_sizes": ask_sizes, "bid_sizes": bid_sizes}
+
+    def _side(self, f: torch.Tensor, gaps: list[int], sizes: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        distance = torch.cumsum(torch.exp(f[..., gaps]), dim=-1)                 # levels 2..L
+        size = torch.expm1(f[..., sizes]).clamp_min(0)
+        level_distance = torch.cat([torch.zeros_like(distance[..., :1]), distance], dim=-1)
+        vwap = (level_distance * size).sum(dim=-1, keepdim=True) / size.sum(dim=-1, keepdim=True).clamp_min(1)
+        return distance, vwap
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f = x * self.scale + self.shift
+        c = self.columns
+        ask, ask_vwap = self._side(f, c["ask_gaps"], c["ask_sizes"])
+        bid, bid_vwap = self._side(f, c["bid_gaps"], c["bid_sizes"])
+        return torch.cat([ask, bid, ask_vwap, bid_vwap], dim=-1)
+
+
 def count_parameters(module: nn.Module | None) -> int:
     return 0 if module is None else sum(p.numel() for p in module.parameters())
 
@@ -280,6 +312,8 @@ class TimeGANConfig:
     static_noise_dim adds noise channels held constant per window (0 = paper).
     difference_weight > 0 adds L_D on step changes to the generator loss
     and change_corr_weight > 0 adds L_C on their correlations (0 = paper).
+    tick_weight > 0 adds L_P, the L_D statistic on the ladder decoded into
+    ticks, which needs a LadderTicks decoder when training.
     """
 
     feature_dim: int
@@ -296,6 +330,7 @@ class TimeGANConfig:
     moment_weight: float = 100.0
     difference_weight: float = 0.0
     change_corr_weight: float = 0.0
+    tick_weight: float = 0.0
     recon_weight: float = 10.0
     embed_supervised_weight: float = 0.1
     sqrt_losses: bool = True
@@ -320,12 +355,14 @@ class TimeGAN(SequenceGAN):
                  discriminator_loss(x)                     trains discriminator
 
     Every loss returns (loss, logs) and only leaves gradients on the networks
-    it trains. logs holds detached values for the training history.
+    it trains. logs holds detached values for the training history. ladder
+    is the LadderTicks decoder behind L_P; sampling and loading do not need it.
     """
 
-    def __init__(self, config: TimeGANConfig):
+    def __init__(self, config: TimeGANConfig, ladder: LadderTicks | None = None):
         super().__init__()
         self.config = c = config
+        self.ladder = ladder
         self.embedder = Embedder(c.feature_dim, c.hidden_dim, c.num_layers, c.rnn_type)
         self.recovery = Recovery(c.feature_dim, c.hidden_dim, c.num_layers, c.rnn_type, c.recovery_activation)
         self.generator = Generator(c.z_dim + c.static_noise_dim, c.hidden_dim, c.num_layers, c.rnn_type)
@@ -408,9 +445,11 @@ class TimeGAN(SequenceGAN):
             L_V    moment loss on decoded features, weight moment_weight
             L_D    step-change loss on decoded features, weight difference_weight
             L_C    step-change correlation loss, weight change_corr_weight
+            L_P    L_D on the ladder decoded into ticks, weight tick_weight
 
         The recovery and discriminator are frozen, so gradients pass through
-        them without changing them. L_D and L_C are logged even at weight 0.
+        them without changing them. L_D and L_C are logged even at weight 0,
+        and L_P whenever there is a decoder.
         """
         c = self.config
         if z is None:
@@ -433,6 +472,13 @@ class TimeGAN(SequenceGAN):
             loss = loss + c.change_corr_weight * correlations
         logs = {"adv": adv.detach(), "adv_e": adv_e.detach(), "moment": moments.detach(),
                 "difference": differences.detach(), "change_corr": correlations.detach()}
+        if c.tick_weight > 0 and self.ladder is None:
+            raise RuntimeError("tick_weight > 0 needs a LadderTicks decoder")
+        if self.ladder is not None:
+            ticks = difference_loss(self.ladder(x_hat), self.ladder(x))
+            if c.tick_weight > 0:
+                loss = loss + c.tick_weight * ticks
+            logs["tick_difference"] = ticks.detach()
         if self.supervisor is not None:
             supervised = self._supervised_mse(h)
             loss = loss + c.eta * self._root(supervised)
