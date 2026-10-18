@@ -29,6 +29,7 @@ HISTORY_PANELS = [
     ("Phase 3: generator terms", "joint",
      [("train", "g_adv", "adversarial"), ("train", "g_adv_e", "adversarial, raw path"),
       ("train", "g_moment", "moment"), ("train", "g_difference", "step change"),
+      ("train", "g_change_corr", "step-change correlation"),
       ("train", "g_supervised_mse", "supervised MSE")], True),
     ("Phase 3: discriminator", "joint",
      [("train", "d_real", "real BCE"), ("train", "d_fake", "fake BCE"),

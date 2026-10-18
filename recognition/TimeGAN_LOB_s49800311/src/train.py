@@ -16,6 +16,8 @@ Examples (from the folder holding src/):
   python src/train.py --data-dir ../../../../data/LOBSTER
   python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8
   python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8 --difference-weight 100
+  python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8 --difference-weight 100 \
+      --change-corr-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --no-supervisor
   python src/train.py --data-dir ../../../../data/LOBSTER --model rgan --baseline-moment-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_timegan_s0 --resume
@@ -65,6 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="TimeGAN noise channels held constant over each window, e.g. 8")
     model.add_argument("--difference-weight", type=float, default=0.0,
                        help="TimeGAN weight of the step-change loss L_D, e.g. 100 (0 = off)")
+    model.add_argument("--change-corr-weight", type=float, default=0.0,
+                       help="TimeGAN weight of the step-change correlation loss L_C, e.g. 100 (0 = off)")
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
     model.add_argument("--paper-weights", action="store_true",
                        help="Loss weights from the paper instead of the authors' code")
