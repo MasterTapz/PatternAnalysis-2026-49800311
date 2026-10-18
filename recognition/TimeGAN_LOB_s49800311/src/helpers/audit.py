@@ -22,17 +22,20 @@ import torch
 from skimage.metrics import structural_similarity
 
 from dataset import TICK, LOBSplits, OrderBook
-from helpers.metrics import (KL_TARGET, book_violations, decode_real_windows, decode_synthetic_windows,
+from helpers.metrics import (KL_TARGET, book_violations, decode_real_windows, decode_synthetic_windows, decode_windows,
                              distribution_report, kl_only, mid_moves, step_violations, vwap_changes,
                              vwap_depth, vwap_report)
-from modules import SequenceGAN
+from modules import SequenceGAN, TimeGAN
 
 SSIM_TARGET = 0.6         # spec target for SSIM of depth snapshots
 SSIM_RANDOM_PAIRS = 1024  # pairs drawn for the random-pair SSIM
 ACF_LAGS = 20
 ACF_KEY = "acf_squared_returns_lags_1_5_10_20"
 SUMMARY_LAGS = (0, 4, 9, 19)   # indices of lags 1, 5, 10 and 20
-SIZE_CHANGE = 0.01             # a level size counts as changed when it moves by more than 1 percent
+# A level size counts as changed when it moves by more than 30 percent. Real
+# changes are large (median 82 percent, since a new queue often takes over the
+# level), while the autoencoder's reconstruction error stays mostly below 20.
+SIZE_CHANGE = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +148,7 @@ def excess_kurtosis(x: torch.Tensor) -> float:
 def level_change_shares(books: list[OrderBook]) -> dict[str, float]:
     """How often the book's levels change from one step to the next.
 
-    size   a level's size moves by more than SIZE_CHANGE
+    size   a level's size moves by more than SIZE_CHANGE (relative)
     gap    a level's distance from the best quote of its side changes
            (levels 2 to 10; level 1 is the best quote itself)
     """
@@ -295,6 +298,13 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
     train_pool = splits.train.stack(range(0, len(splits.train), 4))[0]   # every 4th window keeps cdist small
     nearest_train = {"synthetic": float(nearest_train_distance(fake_x[:512], train_pool).median()),
                      "real_test": float(nearest_train_distance(test_x, train_pool).median())}
+    vwap_sources = dict(books)
+    if isinstance(model, TimeGAN):
+        # The test hour passed through embedder and recovery: the best the
+        # generator could do through this latent space.
+        recon_x = model.reconstruct(test_x.to(device)).cpu()
+        vwap_sources["reconstructed_test"] = decode_windows(recon_x, splits.scaler, test_anchor,
+                                                            splits.representation, splits.move_flag)
 
     summary = {
         "run": run_name,
@@ -315,7 +325,8 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
             "kl_vs_test": vwap_report(real_books, fake_books),
             "kl_vs_train": vwap_report(train_books, fake_books),
             "kl_real_reference": vwap_report(real_books, train_books),
-            "stats": {name: vwap_stats(b, vwap[name]) for name, b in books.items()},
+            "stats": {name: vwap_stats(b, vwap[name] if name in vwap else vwap_arrays(b))
+                      for name, b in vwap_sources.items()},
         },
         "diversity_rms": {"synthetic": mean_pairwise_distance(fake_x), "real_test": mean_pairwise_distance(test_x)},
         "nearest_train_rms_median": nearest_train,
@@ -361,7 +372,10 @@ def print_summary(s: dict) -> None:
                           ("kl_real_reference", "real training vs test")]:
         print(f"  VWAP KL {label:22s} distance from mid {vw[source]['kl_vwap_depth']:.3f}  "
               f"step change {vw[source]['kl_vwap_change']:.3f}")
-    for name, label in [("real_train", "real train"), ("real_test", "real test"), ("synthetic", "synthetic")]:
+    for name, label in [("real_train", "real train"), ("real_test", "real test"),
+                        ("reconstructed_test", "test via AE"), ("synthetic", "synthetic")]:
+        if name not in vw["stats"]:
+            continue
         st = vw["stats"][name]
         print(f"  VWAP {label:10s}  distance bid {st['depth_bid_mean_ticks']:.1f} ask {st['depth_ask_mean_ticks']:.1f} "
               f"ticks   change std {st['change_std_ticks']:.2f} kurtosis {st['change_excess_kurtosis']:.1f}   "
@@ -454,4 +468,7 @@ def vwap_table(summaries: list[dict]) -> str:
                           f"{floor['kl_vwap_change']:.3f}", *_vwap_stat_cells(ref["stats"]["real_train"])])
     real_test = _md_row(["real test hour (reference)", *[""] * 4, *_vwap_stat_cells(ref["stats"]["real_test"])])
     lines = [_md_row(VWAP_COLUMNS), "|" + "---|" * len(VWAP_COLUMNS), *rows, real_train, real_test]
+    if "reconstructed_test" in ref["stats"]:
+        lines.append(_md_row([f"real test hour through {summaries[0]['run']}'s autoencoder (ceiling)", *[""] * 4,
+                              *_vwap_stat_cells(ref["stats"]["reconstructed_test"])]))
     return "\n".join(lines) + "\n"
