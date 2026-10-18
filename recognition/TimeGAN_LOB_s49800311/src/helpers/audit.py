@@ -8,6 +8,8 @@ achievable:
     SSIM            depth heatmaps (20 levels x time, log volume), target > 0.6
     volatility      autocorrelation of squared returns, lags 1 to 20
     price path      how often the mid stays put and how far it wanders
+    VWAP            distance from the mid, step changes, their clustering,
+                    per-window mean and spread, and how often levels change
     diversity       spread of samples and distance to the closest training window
 NumPy and scikit-image are used for SSIM, which the spec allows here.
 """
@@ -21,13 +23,16 @@ from skimage.metrics import structural_similarity
 
 from dataset import TICK, LOBSplits, OrderBook
 from helpers.metrics import (KL_TARGET, book_violations, decode_real_windows, decode_synthetic_windows,
-                             distribution_report, kl_only, mid_moves, step_violations)
+                             distribution_report, kl_only, mid_moves, step_violations, vwap_changes,
+                             vwap_depth, vwap_report)
 from modules import SequenceGAN
 
 SSIM_TARGET = 0.6         # spec target for SSIM of depth snapshots
 SSIM_RANDOM_PAIRS = 1024  # pairs drawn for the random-pair SSIM
 ACF_LAGS = 20
 ACF_KEY = "acf_squared_returns_lags_1_5_10_20"
+SUMMARY_LAGS = (0, 4, 9, 19)   # indices of lags 1, 5, 10 and 20
+SIZE_CHANGE = 0.01             # a level size counts as changed when it moves by more than 1 percent
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +131,74 @@ def price_path_stats(books: list[OrderBook]) -> dict[str, float]:
     }
 
 
+# ---------------------------------------------------------------------------
+# VWAP
+# ---------------------------------------------------------------------------
+
+def excess_kurtosis(x: torch.Tensor) -> float:
+    """Excess kurtosis of all values; 0 for a Gaussian, large for heavy tails."""
+    x = x.flatten().double()
+    x = x - x.mean()
+    return float((x ** 4).mean() / (x ** 2).mean() ** 2 - 3)
+
+
+def level_change_shares(books: list[OrderBook]) -> dict[str, float]:
+    """How often the book's levels change from one step to the next.
+
+    size   a level's size moves by more than SIZE_CHANGE
+    gap    a level's distance from the best quote of its side changes
+           (levels 2 to 10; level 1 is the best quote itself)
+    """
+    size_changed, gap_changed = [], []
+    for b in books:
+        for price, size in [(b.bid_price, b.bid_size), (b.ask_price, b.ask_size)]:
+            size_changed.append((size.diff(dim=0).abs() / size[:-1].abs().clamp_min(1)) > SIZE_CHANGE)
+            offset = (price[:, 1:] - price[:, :1]) / TICK
+            gap_changed.append(torch.round(offset.diff(dim=0)) != 0)
+    return {"level_size_changed_share": float(torch.cat(size_changed).double().mean()),
+            "level_gap_changed_share": float(torch.cat(gap_changed).double().mean())}
+
+
+def vwap_arrays(books: list[OrderBook]) -> dict[str, np.ndarray]:
+    """The VWAP series behind the summary numbers and the VWAP figure, all in ticks.
+
+    depth          distance from the mid to each side's VWAP, bid and ask pooled
+    change         step changes of the bid and ask VWAP, pooled
+    window_depth   per window, the mean of the bid and ask distances
+    window_vol     per window, the std of the VWAP changes (bid and ask averaged)
+    acf_abs        ACF of |change| at lags 1..ACF_LAGS, within windows
+    acf_squared    ACF of change squared, likewise
+    """
+    bid, ask = vwap_depth(books)
+    change = vwap_changes(books)                      # (2n, T - 1), bid rows then ask rows
+    return {
+        "depth": torch.cat([bid, ask]).flatten().numpy(),
+        "change": change.flatten().numpy(),
+        "window_depth": ((bid.mean(dim=1) + ask.mean(dim=1)) / 2).numpy(),
+        "window_vol": change.reshape(2, len(books), -1).std(dim=2).mean(dim=0).numpy(),
+        "acf_abs": pooled_acf(change.abs()),
+        "acf_squared": pooled_acf(change ** 2),
+    }
+
+
+def vwap_stats(books: list[OrderBook], arrays: dict[str, np.ndarray]) -> dict[str, float]:
+    """Summary numbers of one set of books; arrays is its vwap_arrays."""
+    bid, ask = vwap_depth(books)
+    return {
+        "depth_bid_mean_ticks": float(bid.mean()),
+        "depth_ask_mean_ticks": float(ask.mean()),
+        "depth_std_ticks": float(arrays["depth"].std()),
+        "change_std_ticks": float(arrays["change"].std()),
+        "change_excess_kurtosis": excess_kurtosis(torch.from_numpy(arrays["change"])),
+        "window_depth_between_sd": float(arrays["window_depth"].std()),
+        "window_vol_median": float(np.median(arrays["window_vol"])),
+        "window_vol_between_sd": float(arrays["window_vol"].std()),
+        **level_change_shares(books),
+        "acf_abs_change_lags_1_5_10_20": [float(arrays["acf_abs"][i]) for i in SUMMARY_LAGS],
+        "acf_squared_change_lags_1_5_10_20": [float(arrays["acf_squared"][i]) for i in SUMMARY_LAGS],
+    }
+
+
 def mean_pairwise_distance(x: torch.Tensor, n: int = 512, seed: int = 0) -> float:
     """Average RMS distance between windows (B, T, F); low means low diversity."""
     g = torch.Generator().manual_seed(seed)
@@ -178,6 +251,7 @@ class RunAudit:
 
     summary: dict
     acf: dict[str, np.ndarray]       # squared-return ACF for real_train, real_test and synthetic
+    vwap: dict[str, dict[str, np.ndarray]]   # vwap_arrays for real_train, real_test and synthetic
     real_books: list[OrderBook]      # every real test window
     fake_books: list[OrderBook]      # every synthetic window
     nearest: np.ndarray              # SSIM (n_real, n_fake), -1 outside the SSIM pool
@@ -217,6 +291,7 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
     # Clustering is strong in the training hours and weak in the test hour, so both are references.
     books = {"real_train": train_books, "real_test": real_books, "synthetic": fake_books}
     acf = {name: pooled_acf(log_returns(b) ** 2) for name, b in books.items()}
+    vwap = {name: vwap_arrays(b) for name, b in books.items()}
     train_pool = splits.train.stack(range(0, len(splits.train), 4))[0]   # every 4th window keeps cdist small
     nearest_train = {"synthetic": float(nearest_train_distance(fake_x[:512], train_pool).median()),
                      "real_test": float(nearest_train_distance(test_x, train_pool).median())}
@@ -231,15 +306,23 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
         "kl_vs_test": kl_only(distribution_report(real_books, fake_books)),
         "kl_real_reference": kl_only(distribution_report(real_books, train_books)),
         "ssim": ssim_report,
-        ACF_KEY: {k: [float(v[i]) for i in (0, 4, 9, 19)] for k, v in acf.items()},
+        ACF_KEY: {k: [float(v[i]) for i in SUMMARY_LAGS] for k, v in acf.items()},
         "acf_returns_lags_1_3": {name: pooled_acf(log_returns(b))[:3].tolist() for name, b in books.items()},
         "price_path": {name: price_path_stats(b) for name, b in books.items()},
+        # The test hour's book is shallower than the training hours', so KL is
+        # reported against both periods, with real training vs test as the floor.
+        "vwap": {
+            "kl_vs_test": vwap_report(real_books, fake_books),
+            "kl_vs_train": vwap_report(train_books, fake_books),
+            "kl_real_reference": vwap_report(real_books, train_books),
+            "stats": {name: vwap_stats(b, vwap[name]) for name, b in books.items()},
+        },
         "diversity_rms": {"synthetic": mean_pairwise_distance(fake_x), "real_test": mean_pairwise_distance(test_x)},
         "nearest_train_rms_median": nearest_train,
         "autopsy_cases": [{"case": label, "synthetic_index": j, "best_ssim": float(nearest[:, j].max())}
                           for label, j in cases],
     }
-    return RunAudit(summary, acf, real_books, fake_books, nearest, cases, data_range)
+    return RunAudit(summary, acf, vwap, real_books, fake_books, nearest, cases, data_range)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +356,19 @@ def print_summary(s: dict) -> None:
         pp = s["price_path"][name]
         print(f"  price path {label:10s}  zero-move share {pp['zero_move_share']:.3f}   excursion from first mid "
               f"median {pp['excursion_ticks_median']:.1f} ticks, 90th percentile {pp['excursion_ticks_p90']:.1f} ticks")
+    vw = s["vwap"]
+    for source, label in [("kl_vs_train", "vs training"), ("kl_vs_test", "vs test hour"),
+                          ("kl_real_reference", "real training vs test")]:
+        print(f"  VWAP KL {label:22s} distance from mid {vw[source]['kl_vwap_depth']:.3f}  "
+              f"step change {vw[source]['kl_vwap_change']:.3f}")
+    for name, label in [("real_train", "real train"), ("real_test", "real test"), ("synthetic", "synthetic")]:
+        st = vw["stats"][name]
+        print(f"  VWAP {label:10s}  distance bid {st['depth_bid_mean_ticks']:.1f} ask {st['depth_ask_mean_ticks']:.1f} "
+              f"ticks   change std {st['change_std_ticks']:.2f} kurtosis {st['change_excess_kurtosis']:.1f}   "
+              f"ACF |change| lag 1/10 {st['acf_abs_change_lags_1_5_10_20'][0]:.3f}/"
+              f"{st['acf_abs_change_lags_1_5_10_20'][2]:.3f}   between-window sd of mean distance "
+              f"{st['window_depth_between_sd']:.2f}, of change std {st['window_vol_between_sd']:.2f}   "
+              f"levels changed: size {st['level_size_changed_share']:.2f} gap {st['level_gap_changed_share']:.2f}")
     div, near = s["diversity_rms"], s["nearest_train_rms_median"]
     print(f"  diversity (RMS)   synthetic {div['synthetic']:.4f}  real {div['real_test']:.4f}")
     print(f"  nearest training window (median RMS)  synthetic {near['synthetic']:.4f}  "
@@ -323,4 +419,39 @@ def comparison_table(summaries: list[dict]) -> str:
                          *_acf_cells(ref[ACF_KEY]["real_test"]), *_path_cells(ref["price_path"]["real_test"])])
     lines = [_md_row(COMPARISON_COLUMNS), "|" + "---|" * len(COMPARISON_COLUMNS),
              *(_run_row(s) for s in summaries), real_train, real_test]
+    return "\n".join(lines) + "\n"
+
+
+VWAP_COLUMNS = ["Run", "Distance KL vs train", "Distance KL vs test", "Change KL vs train", "Change KL vs test",
+                "Mean distance (ticks)", "Change std (ticks)", "Change kurtosis", "ACF |change| lag 1",
+                "ACF |change| lag 10", "Window mean distance sd", "Window change std sd", "Level sizes changed",
+                "Level gaps changed"]
+
+
+def _vwap_stat_cells(st: dict) -> list[str]:
+    acf = st["acf_abs_change_lags_1_5_10_20"]
+    return [f"{(st['depth_bid_mean_ticks'] + st['depth_ask_mean_ticks']) / 2:.1f}", f"{st['change_std_ticks']:.2f}",
+            f"{st['change_excess_kurtosis']:.1f}", f"{acf[0]:.3f}", f"{acf[2]:.3f}",
+            f"{st['window_depth_between_sd']:.2f}", f"{st['window_vol_between_sd']:.2f}",
+            f"{st['level_size_changed_share']:.2f}", f"{st['level_gap_changed_share']:.2f}"]
+
+
+def vwap_table(summaries: list[dict]) -> str:
+    """Markdown table of the VWAP audit, with the real periods as reference rows.
+
+    "Distance" is the VWAP's distance from the mid (bid and ask pooled),
+    "change" its step-to-step move, both in ticks. The real training row's
+    test-column KL is the real training vs test floor.
+    """
+    ref = summaries[0]["vwap"]
+    floor = ref["kl_real_reference"]
+    rows = [_md_row([s["run"], f"{s['vwap']['kl_vs_train']['kl_vwap_depth']:.3f}",
+                     f"{s['vwap']['kl_vs_test']['kl_vwap_depth']:.3f}",
+                     f"{s['vwap']['kl_vs_train']['kl_vwap_change']:.3f}",
+                     f"{s['vwap']['kl_vs_test']['kl_vwap_change']:.3f}",
+                     *_vwap_stat_cells(s["vwap"]["stats"]["synthetic"])]) for s in summaries]
+    real_train = _md_row(["real training hours (reference)", "", f"{floor['kl_vwap_depth']:.3f}", "",
+                          f"{floor['kl_vwap_change']:.3f}", *_vwap_stat_cells(ref["stats"]["real_train"])])
+    real_test = _md_row(["real test hour (reference)", *[""] * 4, *_vwap_stat_cells(ref["stats"]["real_test"])])
+    lines = [_md_row(VWAP_COLUMNS), "|" + "---|" * len(VWAP_COLUMNS), *rows, real_train, real_test]
     return "\n".join(lines) + "\n"

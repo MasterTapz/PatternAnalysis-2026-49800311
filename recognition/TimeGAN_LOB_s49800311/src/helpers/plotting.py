@@ -139,6 +139,54 @@ def plot_volatility_acf(acf: dict[str, np.ndarray], run_name: str, path: Path) -
     plt.close(fig)
 
 
+# (source key, label, colour, line style, marker)
+VWAP_SOURCES = [
+    ("real_train", "real training hours", "#1f1f1f", "-", "o"),
+    ("real_test", "real test hour", "#8a8a8a", "--", "^"),
+    ("synthetic", "synthetic", "#2a78d6", "-", "s"),
+]
+
+
+def plot_vwap(vwap: dict[str, dict[str, np.ndarray]], run_name: str, path: Path) -> None:
+    """Four VWAP views of one run against both real periods (vwap holds audit.vwap_arrays per source).
+
+    Top: VWAP distance from the mid (book shape at one time) and its step
+    changes (log density, so the tails show). Bottom: clustering of |change|
+    and one point per window, mean distance against change std, which shows
+    whether the windows collapse to a single mean and variance.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5))
+    ax_depth, ax_change, ax_acf, ax_window = axes.flat
+    real = vwap["real_train"]
+    depth_bins = np.linspace(*np.percentile(real["depth"], [0.5, 99.5]), 50)
+    reach = max(abs(np.percentile(vwap[k]["change"], [0.5, 99.5])).max() for k in vwap)
+    change_bins = np.linspace(-reach, reach, 81)
+    lags = np.arange(1, len(real["acf_abs"]) + 1)
+    for key, label, colour, style, marker in VWAP_SOURCES:
+        v = vwap[key]
+        ax_depth.hist(v["depth"], bins=depth_bins, density=True, histtype="step", linestyle=style, linewidth=1.8,
+                      color=colour, label=label)
+        ax_change.hist(v["change"], bins=change_bins, density=True, histtype="step", linestyle=style,
+                       linewidth=1.8, color=colour, label=f"{label} (std {v['change'].std():.2f})")
+        ax_acf.plot(lags, v["acf_abs"], linestyle=style, marker=marker, markersize=4, color=colour, label=label)
+        ax_window.scatter(v["window_depth"], v["window_vol"], s=10 if key == "synthetic" else 18, marker=marker,
+                          color=colour, alpha=0.35 if key == "synthetic" else 0.8, label=label)
+    ax_depth.set(title="VWAP distance from the mid (bid and ask pooled)", xlabel="ticks", ylabel="density")
+    ax_change.set(title="VWAP change per step (bid and ask pooled)", xlabel="ticks", ylabel="density (log)",
+                  yscale="log")
+    ax_acf.axhline(0, color="grey", linewidth=0.8)
+    ax_acf.set(title="Clustering: ACF of |VWAP change|", xlabel="lag (steps of 10 events)", ylabel="autocorrelation")
+    ax_window.set(title="One point per window: does the model keep different regimes?",
+                  xlabel="window mean VWAP distance from mid (ticks)", ylabel="window std of VWAP change (ticks)")
+    for ax in axes.flat:
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+    fig.suptitle(f"VWAP audit: {run_name}")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
 def plot_volatility_comparison(real_train: np.ndarray, real_test: np.ndarray,
                                synthetic: dict[str, np.ndarray], path: Path) -> None:
     """Squared-return ACF of several runs (keyed by run name) on one plot."""

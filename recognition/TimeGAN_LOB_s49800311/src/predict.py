@@ -2,9 +2,9 @@
 
 For each --run, loads best.pt with the data pipeline it was trained on,
 decodes synthetic windows into order books and scores them (validity, KL,
-SSIM, volatility clustering, price paths, diversity) against the test hour
-(15:00 to 15:50). Results go to <run>/predict/. Several runs also get a
-comparison table. --export-assets copies the README figures into a folder.
+SSIM, volatility clustering, price paths, VWAP, diversity) against the test
+hour (15:00 to 15:50). Results go to <run>/predict/. Several runs also get
+comparison tables. --export-assets copies the README figures into a folder.
 
 Examples (from the folder holding src/):
   python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0
@@ -19,9 +19,10 @@ from pathlib import Path
 
 import torch
 
-from helpers.audit import RunAudit, audit_run, comparison_table, print_example_book, print_summary
+from helpers.audit import RunAudit, audit_run, comparison_table, print_example_book, print_summary, vwap_table
 from helpers.checkpoints import load_run
-from helpers.plotting import export_readme_assets, plot_autopsy, plot_volatility_acf, plot_volatility_comparison
+from helpers.plotting import (export_readme_assets, plot_autopsy, plot_volatility_acf, plot_volatility_comparison,
+                              plot_vwap)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -46,7 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def audit_and_save(run_dir: Path, args: argparse.Namespace) -> RunAudit:
-    """Audit one run and write autopsy.png, volatility_acf.png and summary.json to <run>/predict/."""
+    """Audit one run and write autopsy.png, volatility_acf.png, vwap.png and summary.json to <run>/predict/."""
     model, splits, state = load_run(run_dir, args.data_dir, args.device)
     print(f"\n=== {run_dir.name}: {type(model).__name__}, {splits.representation} encoding, "
           f"checkpoint step {state['step']} ===")
@@ -60,17 +61,22 @@ def audit_and_save(run_dir: Path, args: argparse.Namespace) -> RunAudit:
                  f"{run_dir.name}: five rule-selected synthetic windows vs their closest real test window",
                  out_dir / "autopsy.png")
     plot_volatility_acf(audit.acf, run_dir.name, out_dir / "volatility_acf.png")
+    plot_vwap(audit.vwap, run_dir.name, out_dir / "vwap.png")
     (out_dir / "summary.json").write_text(json.dumps(audit.summary, indent=1))
     print_summary(audit.summary)
     return audit
 
 
 def write_comparison(audits: list[RunAudit], out_dir: Path) -> None:
-    """comparison.md and the combined volatility plot; real references come from the first run."""
+    """comparison.md (main and VWAP tables) and the combined volatility plot.
+
+    Real references come from the first run.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     table_path = out_dir / "comparison.md"
+    summaries = [a.summary for a in audits]
     # UTF-8 so the superscript in the header survives on Windows.
-    table_path.write_text(comparison_table([a.summary for a in audits]), encoding="utf-8")
+    table_path.write_text(comparison_table(summaries) + "\n" + vwap_table(summaries), encoding="utf-8")
     reference = audits[0].acf
     plot_volatility_comparison(reference["real_train"], reference["real_test"],
                                {a.summary["run"]: a.acf["synthetic"] for a in audits},
