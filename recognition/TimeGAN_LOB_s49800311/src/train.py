@@ -37,7 +37,8 @@ from torch.utils.data import DataLoader
 
 from dataset import LOBSplits, LOBWindowDataset, build_datasets
 from helpers.checkpoints import (BEST_CHECKPOINT, LAST_CHECKPOINT, MODELS, PHASES, build_model, default_run_name,
-                                 load_checkpoint, restore_rng_state, resumed_args, rng_state, run_state)
+                                 ladder_decoder, load_checkpoint, restore_rng_state, resumed_args, rng_state,
+                                 run_state)
 from helpers.evaluation import Evaluator, evaluate_test
 from helpers.plotting import plot_history
 from modules import TimeGAN
@@ -69,6 +70,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="TimeGAN weight of the step-change loss L_D, e.g. 100 (0 = off)")
     model.add_argument("--change-corr-weight", type=float, default=0.0,
                        help="TimeGAN weight of the step-change correlation loss L_C, e.g. 100 (0 = off)")
+    model.add_argument("--tick-weight", type=float, default=0.0,
+                       help="TimeGAN weight of L_P, the step-change loss on the ladder in ticks "
+                            "(structured encoding only; 0 = off)")
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
     model.add_argument("--paper-weights", action="store_true",
                        help="Loss weights from the paper instead of the authors' code")
@@ -96,6 +100,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.model == "rgan" and args.no_supervisor:
         p.error("--no-supervisor only applies to --model timegan")
+    if args.tick_weight > 0 and args.representation != "structured":
+        p.error("--tick-weight needs the structured encoding")
     if args.run_name is None:
         args.run_name = default_run_name(args)
     return args
@@ -129,7 +135,7 @@ class Trainer:
     def __init__(self, args: argparse.Namespace, splits: LOBSplits, run_dir: Path):
         self.args, self.splits, self.run_dir = args, splits, run_dir
         self.device = args.device
-        self.model = build_model(args, len(splits.feature_names)).to(self.device)
+        self.model = build_model(args, len(splits.feature_names), ladder_decoder(splits)).to(self.device)
         self.is_timegan = isinstance(self.model, TimeGAN)
         self.optimisers = self._build_optimisers()
         self.evaluator = Evaluator(splits, self.device, args.eval_samples, args.seed)

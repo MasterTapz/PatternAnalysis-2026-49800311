@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 from dataset import LOBSplits, build_datasets
-from modules import RecurrentGAN, RecurrentGANConfig, SequenceGAN, TimeGAN, TimeGANConfig
+from modules import LadderTicks, RecurrentGAN, RecurrentGANConfig, SequenceGAN, TimeGAN, TimeGANConfig
 
 PHASES = ("autoencoder", "supervisor", "joint")
 MODELS = {"timegan": (TimeGAN, TimeGANConfig), "rgan": (RecurrentGAN, RecurrentGANConfig)}
@@ -29,7 +29,7 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>]_s<seed>.
+    """<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>]_s<seed>.
 
     variant is timegan, nosup (no supervisor), rgan (plain baseline) or
     rganm (baseline with the moment loss). Every option that changes the
@@ -46,11 +46,28 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix += f"_sn{args.static_noise_dim}" if args.static_noise_dim > 0 and args.model == "timegan" else ""
     suffix += f"_dw{args.difference_weight:g}" if args.difference_weight > 0 and args.model == "timegan" else ""
     suffix += f"_cc{args.change_corr_weight:g}" if args.change_corr_weight > 0 and args.model == "timegan" else ""
+    suffix += f"_tw{args.tick_weight:g}" if args.tick_weight > 0 and args.model == "timegan" else ""
     return f"{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
-def build_model(args: argparse.Namespace, feature_dim: int) -> SequenceGAN:
-    """TimeGAN, its ablation or the baseline, as set on the command line."""
+def ladder_decoder(splits: LOBSplits) -> LadderTicks | None:
+    """The tick-space decoder behind L_P, for the structured encoding only."""
+    if splits.representation != "structured":
+        return None
+    names = splits.feature_names
+
+    def columns(prefix: str) -> list[int]:
+        return [i for i, name in enumerate(names) if name.startswith(prefix)]
+
+    return LadderTicks(splits.scaler.shift, splits.scaler.scale, columns("log_ask_gap"), columns("log_bid_gap"),
+                       columns("log1p_ask_size"), columns("log1p_bid_size"))
+
+
+def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks | None = None) -> SequenceGAN:
+    """TimeGAN, its ablation or the baseline, as set on the command line.
+
+    ladder is the decoder TimeGAN needs for L_P (see ladder_decoder).
+    """
     activation = "sigmoid" if args.scaling == "minmax" else "identity"
     if args.model == "rgan":
         return RecurrentGAN(RecurrentGANConfig(
@@ -66,8 +83,9 @@ def build_model(args: argparse.Namespace, feature_dim: int) -> SequenceGAN:
         static_noise_dim=args.static_noise_dim,
         difference_weight=args.difference_weight,
         change_corr_weight=args.change_corr_weight,
+        tick_weight=args.tick_weight,
         **(paper if args.paper_weights else {}),
-    ))
+    ), ladder)
 
 
 def model_type(model: SequenceGAN) -> str:
