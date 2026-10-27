@@ -18,6 +18,7 @@ Examples (from the folder holding src/):
   python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8 --difference-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8 --difference-weight 100 \
       --change-corr-weight 100
+  python src/train.py --data-dir ../../../../data/LOBSTER --representation raw --book-weight 10
   python src/train.py --data-dir ../../../../data/LOBSTER --no-supervisor
   python src/train.py --data-dir ../../../../data/LOBSTER --model rgan --baseline-moment-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --ticker INTC --clock-seconds 1 --seq-len 504 \
@@ -38,9 +39,9 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
 from dataset import TICKERS, LOBSplits, LOBWindowDataset, build_datasets
-from helpers.checkpoints import (BEST_CHECKPOINT, LAST_CHECKPOINT, MODELS, PHASES, build_model, default_run_name,
-                                 ladder_decoder, load_checkpoint, restore_rng_state, resumed_args, rng_state,
-                                 run_state)
+from helpers.checkpoints import (BEST_CHECKPOINT, LAST_CHECKPOINT, MODELS, PHASES, book_penalty, build_model,
+                                 default_run_name, ladder_decoder, load_checkpoint, restore_rng_state, resumed_args,
+                                 rng_state, run_state)
 from helpers.evaluation import Evaluator, evaluate_test
 from helpers.plotting import plot_history
 from modules import TimeGAN
@@ -81,6 +82,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument("--tick-weight", type=float, default=0.0,
                        help="TimeGAN weight of L_P, the step-change loss on the ladder in ticks "
                             "(structured encoding only; 0 = off)")
+    model.add_argument("--book-weight", type=float, default=0.0,
+                       help="TimeGAN weight of L_book, hinge penalties on spreads under one tick and "
+                            "out-of-order levels (raw encoding only; 0 = off), e.g. 1, 10 or 100")
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
     model.add_argument("--paper-weights", action="store_true",
                        help="Loss weights from the paper instead of the authors' code")
@@ -110,6 +114,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--no-supervisor only applies to --model timegan")
     if args.tick_weight > 0 and args.representation != "structured":
         p.error("--tick-weight needs the structured encoding")
+    if args.book_weight > 0 and args.representation != "raw":
+        p.error("--book-weight needs the raw encoding; the structured one is valid by construction")
     if args.run_name is None:
         args.run_name = default_run_name(args)
     return args
@@ -143,7 +149,8 @@ class Trainer:
     def __init__(self, args: argparse.Namespace, splits: LOBSplits, run_dir: Path):
         self.args, self.splits, self.run_dir = args, splits, run_dir
         self.device = args.device
-        self.model = build_model(args, len(splits.feature_names), ladder_decoder(splits)).to(self.device)
+        self.model = build_model(args, len(splits.feature_names), ladder_decoder(splits),
+                                 book_penalty(splits)).to(self.device)
         self.is_timegan = isinstance(self.model, TimeGAN)
         self.optimisers = self._build_optimisers()
         self.evaluator = Evaluator(splits, self.device, args.eval_samples, args.seed)

@@ -160,6 +160,41 @@ class LadderTicks(nn.Module):
         return torch.cat([ask, bid, ask_vwap, bid_vwap], dim=-1)
 
 
+class RawBookPenalty(nn.Module):
+    """L_book: hinge penalties on books decoded from scaled raw features (B, T, F).
+
+    The raw encoding stores each level's distance from the mid in ticks, ask
+    levels above it and bid levels below, and nothing keeps them in order. A
+    valid book has a spread of at least one tick and at least one tick between
+    neighbouring levels, so with margin m = 1 tick:
+        L_spread = mean over batch and steps of relu(m - (ask_1 + bid_1))^2
+        L_ladder = mean of (sum over k of relu(m - (ask_k+1 - ask_k)) + relu(m - (bid_k+1 - bid_k)))^2
+    Both are zero on every real book and grow with the size of a violation.
+    The margin is a whole tick, not zero, so neighbouring levels stay apart
+    after rounding to the tick grid. There is no volume term: with min-max
+    scaling and a sigmoid recovery, a decoded size can never fall below the
+    training minimum, which is positive. Like LadderTicks, it is only needed
+    for training and is not saved in checkpoints.
+    """
+
+    def __init__(self, shift: torch.Tensor, scale: torch.Tensor, ask_offsets: list[int], bid_offsets: list[int],
+                 margin: float = 1.0):
+        super().__init__()
+        self.register_buffer("shift", shift.float(), persistent=False)
+        self.register_buffer("scale", scale.float(), persistent=False)
+        self.ask_offsets, self.bid_offsets = ask_offsets, bid_offsets
+        self.margin = margin
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(L_spread, L_ladder) of a batch."""
+        f = x * self.scale + self.shift
+        ask, bid = f[..., self.ask_offsets], f[..., self.bid_offsets]
+        spread = F.relu(self.margin - (ask[..., 0] + bid[..., 0])).pow(2).mean()
+        gaps = torch.cat([ask.diff(dim=-1), bid.diff(dim=-1)], dim=-1)
+        ladder = F.relu(self.margin - gaps).sum(dim=-1).pow(2).mean()
+        return spread, ladder
+
+
 def count_parameters(module: nn.Module | None) -> int:
     return 0 if module is None else sum(p.numel() for p in module.parameters())
 
@@ -313,7 +348,9 @@ class TimeGANConfig:
     difference_weight > 0 adds L_D on step changes to the generator loss
     and change_corr_weight > 0 adds L_C on their correlations (0 = paper).
     tick_weight > 0 adds L_P, the L_D statistic on the ladder decoded into
-    ticks, which needs a LadderTicks decoder when training.
+    ticks, which needs a LadderTicks decoder when training. book_weight > 0
+    adds L_book, the raw encoding's hinge penalties, which needs a
+    RawBookPenalty.
     """
 
     feature_dim: int
@@ -331,6 +368,7 @@ class TimeGANConfig:
     difference_weight: float = 0.0
     change_corr_weight: float = 0.0
     tick_weight: float = 0.0
+    book_weight: float = 0.0
     recon_weight: float = 10.0
     embed_supervised_weight: float = 0.1
     sqrt_losses: bool = True
@@ -356,13 +394,16 @@ class TimeGAN(SequenceGAN):
 
     Every loss returns (loss, logs) and only leaves gradients on the networks
     it trains. logs holds detached values for the training history. ladder
-    is the LadderTicks decoder behind L_P; sampling and loading do not need it.
+    is the LadderTicks decoder behind L_P and book the RawBookPenalty behind
+    L_book; sampling and loading need neither.
     """
 
-    def __init__(self, config: TimeGANConfig, ladder: LadderTicks | None = None):
+    def __init__(self, config: TimeGANConfig, ladder: LadderTicks | None = None,
+                 book: RawBookPenalty | None = None):
         super().__init__()
         self.config = c = config
         self.ladder = ladder
+        self.book = book
         self.embedder = Embedder(c.feature_dim, c.hidden_dim, c.num_layers, c.rnn_type)
         self.recovery = Recovery(c.feature_dim, c.hidden_dim, c.num_layers, c.rnn_type, c.recovery_activation)
         self.generator = Generator(c.z_dim + c.static_noise_dim, c.hidden_dim, c.num_layers, c.rnn_type)
@@ -446,10 +487,11 @@ class TimeGAN(SequenceGAN):
             L_D    step-change loss on decoded features, weight difference_weight
             L_C    step-change correlation loss, weight change_corr_weight
             L_P    L_D on the ladder decoded into ticks, weight tick_weight
+            L_book spread and ladder hinges on raw books, weight book_weight
 
         The recovery and discriminator are frozen, so gradients pass through
         them without changing them. L_D and L_C are logged even at weight 0,
-        and L_P whenever there is a decoder.
+        and L_P and L_book whenever there is a decoder.
         """
         c = self.config
         if z is None:
@@ -479,6 +521,13 @@ class TimeGAN(SequenceGAN):
             if c.tick_weight > 0:
                 loss = loss + c.tick_weight * ticks
             logs["tick_difference"] = ticks.detach()
+        if c.book_weight > 0 and self.book is None:
+            raise RuntimeError("book_weight > 0 needs a RawBookPenalty")
+        if self.book is not None:
+            spread_hinge, ladder_hinge = self.book(x_hat)
+            if c.book_weight > 0:
+                loss = loss + c.book_weight * (spread_hinge + ladder_hinge)
+            logs["book_spread"], logs["book_ladder"] = spread_hinge.detach(), ladder_hinge.detach()
         if self.supervisor is not None:
             supervised = self._supervised_mse(h)
             loss = loss + c.eta * self._root(supervised)

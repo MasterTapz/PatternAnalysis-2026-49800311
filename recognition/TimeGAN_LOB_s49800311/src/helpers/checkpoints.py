@@ -17,7 +17,8 @@ from pathlib import Path
 import torch
 
 from dataset import LOBSplits, build_datasets
-from modules import LadderTicks, RecurrentGAN, RecurrentGANConfig, SequenceGAN, TimeGAN, TimeGANConfig
+from modules import (LadderTicks, RawBookPenalty, RecurrentGAN, RecurrentGANConfig, SequenceGAN, TimeGAN,
+                     TimeGANConfig)
 
 PHASES = ("autoencoder", "supervisor", "joint")
 MODELS = {"timegan": (TimeGAN, TimeGANConfig), "rgan": (RecurrentGAN, RecurrentGANConfig)}
@@ -29,7 +30,7 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>]_s<seed>.
+    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>][_bw<w>]_s<seed>.
 
     data is <ticker>_<clock>_T<seq_len>[_v<eval stride>], with clock 1s for a
     one-second clock or e10 for every 10th event, e.g. INTC_1s_T504_v24. It is
@@ -54,6 +55,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix += f"_dw{args.difference_weight:g}" if args.difference_weight > 0 and args.model == "timegan" else ""
     suffix += f"_cc{args.change_corr_weight:g}" if args.change_corr_weight > 0 and args.model == "timegan" else ""
     suffix += f"_tw{args.tick_weight:g}" if args.tick_weight > 0 and args.model == "timegan" else ""
+    suffix += f"_bw{args.book_weight:g}" if args.book_weight > 0 and args.model == "timegan" else ""
     return f"{prefix}{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
@@ -70,10 +72,22 @@ def ladder_decoder(splits: LOBSplits) -> LadderTicks | None:
                        columns("log1p_ask_size"), columns("log1p_bid_size"))
 
 
-def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks | None = None) -> SequenceGAN:
+def book_penalty(splits: LOBSplits) -> RawBookPenalty | None:
+    """The hinge penalties behind L_book, for the raw encoding only."""
+    if splits.representation != "raw":
+        return None
+    names = splits.feature_names
+    return RawBookPenalty(splits.scaler.shift, splits.scaler.scale,
+                          [names.index(f"ask_offset_{k}") for k in range(1, 11)],
+                          [names.index(f"bid_offset_{k}") for k in range(1, 11)])
+
+
+def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks | None = None,
+                book: RawBookPenalty | None = None) -> SequenceGAN:
     """TimeGAN, its ablation or the baseline, as set on the command line.
 
-    ladder is the decoder TimeGAN needs for L_P (see ladder_decoder).
+    ladder is the decoder TimeGAN needs for L_P (see ladder_decoder) and
+    book the penalty behind L_book (see book_penalty).
     """
     activation = "sigmoid" if args.scaling == "minmax" else "identity"
     if args.model == "rgan":
@@ -91,8 +105,9 @@ def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks 
         difference_weight=args.difference_weight,
         change_corr_weight=args.change_corr_weight,
         tick_weight=args.tick_weight,
+        book_weight=args.book_weight,
         **(paper if args.paper_weights else {}),
-    ), ladder)
+    ), ladder, book)
 
 
 def model_type(model: SequenceGAN) -> str:

@@ -30,6 +30,7 @@ HISTORY_PANELS = [
      [("train", "g_adv", "adversarial"), ("train", "g_adv_e", "adversarial, raw path"),
       ("train", "g_moment", "moment"), ("train", "g_difference", "step change"),
       ("train", "g_change_corr", "step-change correlation"), ("train", "g_tick_difference", "step change in ticks"),
+      ("train", "g_book_spread", "spread hinge"), ("train", "g_book_ladder", "ladder hinge"),
       ("train", "g_supervised_mse", "supervised MSE")], True),
     ("Phase 3: discriminator", "joint",
      [("train", "d_real", "real BCE"), ("train", "d_fake", "fake BCE"),
