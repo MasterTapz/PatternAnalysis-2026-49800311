@@ -2,8 +2,10 @@
 
 For TimeGAN, its no-supervisor ablation and the baseline, every loss runs
 forward and backward and only the intended networks may get gradients.
-Sampling must give the right shape and range. A last test overfits the
-autoencoder on one batch to show phase 1 learns more than the feature means.
+Sampling must give the right shape and range. The ticker-conditioned TimeGAN
+gets the same checks with the batch split into pseudo-tickers, and must
+refuse to sample without a ticker. A last test overfits the autoencoder on
+one batch to show phase 1 learns more than the feature means.
 
 Run from the folder holding src/ and tests/:
   python tests/check_modules.py --data-dir ../../../../data/LOBSTER
@@ -120,6 +122,44 @@ def check_baseline(x: torch.Tensor, config: RecurrentGANConfig) -> None:
     print_sample(samples)
 
 
+def check_conditional(x: torch.Tensor, config: TimeGANConfig) -> None:
+    """The conditional model on labelled pseudo-tickers: losses, gradients and per-ticker sampling."""
+    k = config.num_tickers
+    label = torch.arange(len(x), device=x.device) % k
+    model = TimeGAN(config).to(x.device).train()
+    print(f"\n[conditional TimeGAN, {k} tickers] parameters: {model.parameter_counts()}")
+    phases = [
+        ("autoencoder+supervised", lambda: model.autoencoder_loss(x, with_supervised=True, label=label),
+         {"embedder", "recovery"}),
+        ("supervisor", lambda: model.supervisor_loss(x, label=label), {"supervisor"}),
+        ("generator", lambda: model.generator_loss(x, label=label), {"generator", "supervisor"}),
+        ("discriminator", lambda: model.discriminator_loss(x, label=label), {"discriminator"}),
+    ]
+    for phase, loss_fn, trained in phases:
+        model.zero_grad(set_to_none=True)
+        loss, logs = loss_fn()
+        assert loss.dim() == 0 and bool(torch.isfinite(loss)), f"conditional {phase}: loss is not a finite scalar"
+        loss.backward()
+        check_gradients(model, trained, f"conditional {phase}")
+        print(f"  {phase:23s} " + "  ".join(f"{name} {float(v):.4f}" for name, v in logs.items()))
+    try:
+        model.sample(4, x.shape[1], x.device)
+        raise AssertionError("a conditional model must not sample without a ticker")
+    except RuntimeError:
+        print("  sampling without a ticker is refused, as intended")
+    z = model.noise(16, x.shape[1], x.device)
+    with torch.no_grad():
+        outputs = []
+        for ticker in range(k):
+            with model.conditioned_on(ticker):
+                outputs.append(model.generate(z))
+                assert model.sample(8, x.shape[1], x.device).shape == (8, x.shape[1], x.shape[2])
+    assert model.fixed_label is None, "conditioned_on did not restore the ticker"
+    gaps = [float((o - outputs[0]).abs().mean()) for o in outputs[1:]]
+    assert all(g > 0 for g in gaps), "tickers gave identical outputs for the same noise"
+    print("  same noise, other tickers: mean |difference| from ticker 0 " + ", ".join(f"{g:.4f}" for g in gaps))
+
+
 def overfit_autoencoder(x: torch.Tensor, config: TimeGANConfig, steps: int) -> None:
     """Phase 1 on one batch must beat predicting each feature's mean.
 
@@ -175,6 +215,8 @@ def main(argv: list[str] | None = None) -> None:
     check_model(batch, TimeGANConfig(**base), "TimeGAN")
     check_model(batch, TimeGANConfig(**base, use_supervisor=False), "ablation: no supervisor")
     check_baseline(batch, RecurrentGANConfig(**base))
+    if args.rnn_type == "gru":
+        check_conditional(batch, TimeGANConfig(**base, num_tickers=5))
     if args.overfit_steps > 0:
         overfit_autoencoder(batch, TimeGANConfig(**base), args.overfit_steps)
     print("\nAll checks passed.")
