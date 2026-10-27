@@ -289,12 +289,17 @@ def _parity_spread(spread_ticks: torch.Tensor, mid: torch.Tensor) -> torch.Tenso
     return torch.where(nearest < 1, nearest + 2, nearest)
 
 
-def _hold_sides(book: OrderBook, held: torch.Tensor) -> OrderBook:
+def _hold_sides(book: OrderBook, held: torch.Tensor, mid: torch.Tensor, round_to_tick: bool) -> OrderBook:
     """Copy each side flagged as unchanged (held, (T, 2) for bid and ask) from its last unflagged step.
 
-    The first step is never held, since the book before the window is
-    unknown. A copied side that would meet or cross the other side is
-    released for that step, so both sides then come from the same step.
+    When only one side is held, the free side keeps its own gaps and sizes but
+    is shifted so its best quote mirrors the held one around the generated
+    mid, and the book's mid stays on the generated mid path. Building it from
+    the mid and the generated spread instead moved the mid whenever the
+    spread changed: on one run the mid moved on 84% of steps against 29% in
+    real data. The first step is never held, since the book before the window
+    is unknown, and a step where the result would meet or cross is released,
+    taking both sides from that step.
     """
     steps = torch.arange(len(book))
     held = held.clone()
@@ -304,10 +309,17 @@ def _hold_sides(book: OrderBook, held: torch.Tensor) -> OrderBook:
         return torch.cummax(torch.where(h, torch.zeros_like(steps), steps), dim=0).values
 
     bid, ask = last_free(held[:, 0]), last_free(held[:, 1])
-    crossed = book.bid_price[bid, 0] >= book.ask_price[ask, 0]
+    bid_price, ask_price = book.bid_price[bid], book.ask_price[ask]
+    shift = (2 * mid - bid_price[:, 0] - ask_price[:, 0])[:, None]
+    if round_to_tick:
+        shift = torch.round(shift / TICK) * TICK
+    ask_price = torch.where((held[:, 0] & ~held[:, 1])[:, None], ask_price + shift, ask_price)
+    bid_price = torch.where((held[:, 1] & ~held[:, 0])[:, None], bid_price + shift, bid_price)
+    crossed = (bid_price[:, 0] >= ask_price[:, 0])
     bid, ask = torch.where(crossed, steps, bid), torch.where(crossed, steps, ask)
-    return OrderBook(time=book.time, ask_price=book.ask_price[ask], ask_size=book.ask_size[ask],
-                     bid_price=book.bid_price[bid], bid_size=book.bid_size[bid])
+    return OrderBook(time=book.time,
+                     ask_price=torch.where(crossed[:, None], book.ask_price, ask_price), ask_size=book.ask_size[ask],
+                     bid_price=torch.where(crossed[:, None], book.bid_price, bid_price), bid_size=book.bid_size[bid])
 
 
 def decode_book(
@@ -367,7 +379,7 @@ def decode_book(
         bid_price=bid_price,
         bid_size=sizes[:, levels:],
     )
-    return _hold_sides(book, flags[:, -2:] >= 0.5) if hold_flags else book
+    return _hold_sides(book, flags[:, -2:] >= 0.5, mid, round_to_tick) if hold_flags else book
 
 
 # ---------------------------------------------------------------------------
