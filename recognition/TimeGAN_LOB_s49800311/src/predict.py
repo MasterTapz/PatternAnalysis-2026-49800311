@@ -47,25 +47,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def audit_and_save(run_dir: Path, args: argparse.Namespace) -> RunAudit:
-    """Audit one run and write autopsy.png, volatility_acf.png, vwap.png and summary.json to <run>/predict/."""
-    model, splits, state = load_run(run_dir, args.data_dir, args.device)
-    print(f"\n=== {run_dir.name}: {type(model).__name__}, {splits.representation} encoding, "
-          f"checkpoint step {state['step']} ===")
-    audit = audit_run(model, splits, run_dir.name, state["step"], n_samples=args.n_samples,
-                      ssim_pool=args.ssim_pool, seed=args.seed, device=args.device)
-    print_example_book(audit.fake_books[0])
+def audit_and_save(run_dir: Path, args: argparse.Namespace) -> list[RunAudit]:
+    """Audit one run and write autopsy.png, volatility_acf.png, vwap.png and summary.json to <run>/predict/.
 
-    out_dir = run_dir / "predict"
-    out_dir.mkdir(exist_ok=True)
-    plot_autopsy(audit.cases, audit.fake_books, audit.real_books, audit.nearest, audit.data_range,
-                 f"{run_dir.name}: five rule-selected synthetic windows vs their closest real test window",
-                 out_dir / "autopsy.png")
-    plot_volatility_acf(audit.acf, run_dir.name, out_dir / "volatility_acf.png")
-    plot_vwap(audit.vwap, run_dir.name, out_dir / "vwap.png")
-    (out_dir / "summary.json").write_text(json.dumps(audit.summary, indent=1))
-    print_summary(audit.summary)
-    return audit
+    A run on several tickers is audited once per ticker, as <run>[<ticker>],
+    into <run>/predict/<ticker>/; a conditional model samples that ticker.
+    """
+    model, splits, state = load_run(run_dir, args.data_dir, args.device)
+    audits = []
+    for k, ticker_splits in enumerate(splits):
+        name, out_dir = run_dir.name, run_dir / "predict"
+        if len(splits) > 1:
+            ticker = ticker_splits.config["ticker"]
+            name, out_dir = f"{run_dir.name}[{ticker}]", out_dir / ticker
+        print(f"\n=== {name}: {type(model).__name__}, {ticker_splits.representation} encoding, "
+              f"checkpoint step {state['step']} ===")
+        with model.conditioned_on(k if model.conditional else None):
+            audit = audit_run(model, ticker_splits, name, state["step"], n_samples=args.n_samples,
+                              ssim_pool=args.ssim_pool, seed=args.seed, device=args.device)
+        print_example_book(audit.fake_books[0])
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        plot_autopsy(audit.cases, audit.fake_books, audit.real_books, audit.nearest, audit.data_range,
+                     f"{name}: five rule-selected synthetic windows vs their closest real test window",
+                     out_dir / "autopsy.png")
+        plot_volatility_acf(audit.acf, name, out_dir / "volatility_acf.png")
+        plot_vwap(audit.vwap, name, out_dir / "vwap.png")
+        (out_dir / "summary.json").write_text(json.dumps(audit.summary, indent=1))
+        print_summary(audit.summary)
+        audits.append(audit)
+    return audits
 
 
 def write_comparison(audits: list[RunAudit], out_dir: Path) -> None:
@@ -97,7 +108,7 @@ def write_comparison(audits: list[RunAudit], out_dir: Path) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    audits = [audit_and_save(Path(r), args) for r in args.run]
+    audits = [audit for r in args.run for audit in audit_and_save(Path(r), args)]
     if len(audits) > 1:
         write_comparison(audits, Path(args.out_dir))
     if args.export_assets is not None:
