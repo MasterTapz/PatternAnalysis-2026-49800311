@@ -58,6 +58,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--scaling", choices=("minmax", "standard"), default="minmax")
     data.add_argument("--seq-len", type=int, default=64)
     data.add_argument("--event-stride", type=int, default=10)
+    data.add_argument("--clock-seconds", type=float, default=0,
+                      help="Sample the book every this many seconds instead of every --event-stride events, "
+                           "e.g. 1 (0 = event clock)")
     data.add_argument("--move-flag", action="store_true", help="Add a binary mid-moved feature")
 
     model = p.add_argument_group("model")
@@ -378,7 +381,7 @@ def main(argv: list[str] | None = None) -> Path:
 
     splits = build_datasets(args.data_dir, ticker=args.ticker, seq_len=args.seq_len,
                             representation=args.representation, event_stride=args.event_stride,
-                            scaling=args.scaling, move_flag=args.move_flag)
+                            clock_seconds=args.clock_seconds, scaling=args.scaling, move_flag=args.move_flag)
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()

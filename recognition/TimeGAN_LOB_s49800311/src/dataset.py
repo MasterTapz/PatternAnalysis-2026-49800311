@@ -125,14 +125,18 @@ def load_lobster(data_dir: str | Path, ticker: str = "AMZN", levels: int = 10) -
     )
 
 
+def session_bounds(open_minutes: float = 10, close_minutes: float = 10) -> tuple[float, float]:
+    """Start and end of the kept session in seconds after midnight."""
+    return MARKET_OPEN + open_minutes * 60, MARKET_CLOSE - close_minutes * 60
+
+
 def trim_session(book: OrderBook, open_minutes: float = 10, close_minutes: float = 10) -> OrderBook:
     """Drop the first and last minutes of trading.
 
     On this day the opening minutes have about twice the usual spread and the
     closing minutes about twice the usual event rate.
     """
-    start = MARKET_OPEN + open_minutes * 60
-    end = MARKET_CLOSE - close_minutes * 60
+    start, end = session_bounds(open_minutes, close_minutes)
     return book.select((book.time >= start) & (book.time < end))
 
 
@@ -141,6 +145,25 @@ def subsample_events(book: OrderBook, stride: int) -> OrderBook:
     if stride < 1:
         raise ValueError("stride must be at least 1")
     return book.select(slice(None, None, stride))
+
+
+def sample_clock(book: OrderBook, seconds: float, start: float, end: float) -> OrderBook:
+    """The book on a fixed clock from start to end, one row every `seconds`.
+
+    Each row is the book after the last event at or before its clock time, so
+    a second without events repeats the previous book. One step then means the
+    same length of time for every ticker, whatever its event rate. Pass the
+    untrimmed book: the first row needs the last event before start.
+    """
+    if seconds <= 0:
+        raise ValueError("seconds must be positive")
+    grid = torch.arange(start, end, seconds, dtype=torch.float64)
+    rows = torch.searchsorted(book.time, grid, right=True) - 1
+    if int(rows[0]) < 0:
+        raise ValueError("The clock starts before the first event")
+    sampled = book.select(rows)
+    sampled.time = grid
+    return sampled
 
 
 def split_by_time(time: torch.Tensor, train_end: str = "14:00", val_end: str = "15:00") -> dict[str, slice]:
@@ -434,6 +457,7 @@ def build_datasets(
     seq_len: int = 64,
     representation: str = "structured",
     event_stride: int = 10,
+    clock_seconds: float = 0,
     scaling: str = "minmax",
     open_minutes: float = 10,
     close_minutes: float = 10,
@@ -445,6 +469,8 @@ def build_datasets(
 ) -> LOBSplits:
     """Run the whole pipeline and return the three windowed periods.
 
+    One step is every event_stride-th event, or one clock tick of
+    clock_seconds when that is above 0 (event_stride is then unused).
     Encoding happens before the split. Each feature only looks one step back,
     so the first validation return uses the last training mid, which is past
     data. The scaler sees training rows only, and evaluation windows do not
@@ -454,7 +480,11 @@ def build_datasets(
     config["data_dir"] = str(data_dir)
     config["eval_stride"] = eval_stride = eval_stride or seq_len
 
-    book = subsample_events(trim_session(load_lobster(data_dir, ticker), open_minutes, close_minutes), event_stride)
+    book = load_lobster(data_dir, ticker)
+    if clock_seconds > 0:
+        book = sample_clock(book, clock_seconds, *session_bounds(open_minutes, close_minutes))
+    else:
+        book = subsample_events(trim_session(book, open_minutes, close_minutes), event_stride)
     features = encode_book(book, representation, move_flag)
     prev_mid = book.mid[:-1]
     time = book.time[1:]
