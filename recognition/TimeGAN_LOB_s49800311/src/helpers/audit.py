@@ -262,6 +262,7 @@ class RunAudit:
     nearest: np.ndarray              # SSIM (n_real, n_fake), -1 outside the SSIM pool
     cases: list[tuple[str, int]]     # autopsy cases as (label, synthetic index)
     data_range: float                # log-volume range shared by every heatmap
+    realism_features: dict           # window_features of real_train, real_test (non-overlapping) and synthetic
 
 
 def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_step: int,
@@ -308,9 +309,11 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
         vwap_sources["reconstructed_test"] = decode_windows(recon_x, splits.scaler, test_anchor,
                                                             splits.representation, splits.move_flag)
     # The realism yardsticks need non-overlapping windows on the real side.
-    realism = judge(window_features(train_books),
-                    window_features([real_books[i] for i in splits.test.disjoint_indices()]),
-                    window_features(fake_books), seed=seed)
+    realism_features = {"real_train": window_features(train_books),
+                        "real_test": window_features([real_books[i] for i in splits.test.disjoint_indices()]),
+                        "synthetic": window_features(fake_books)}
+    realism = judge(realism_features["real_train"], realism_features["real_test"], realism_features["synthetic"],
+                    seed=seed)
 
     summary = {
         "run": run_name,
@@ -341,7 +344,7 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
         "autopsy_cases": [{"case": label, "synthetic_index": j, "best_ssim": float(nearest[:, j].max())}
                           for label, j in cases],
     }
-    return RunAudit(summary, acf, vwap, real_books, fake_books, nearest, cases, data_range)
+    return RunAudit(summary, acf, vwap, real_books, fake_books, nearest, cases, data_range, realism_features)
 
 
 # ---------------------------------------------------------------------------

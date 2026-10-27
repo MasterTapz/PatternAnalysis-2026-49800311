@@ -4,7 +4,11 @@ The checks follow the tutor's list:
     1  the book at one time       spread and level-1 queue imbalance
                                   (rule violations are counted in metrics.py)
     2  how bids and asks move     changes of the bid and ask VWAP over 1, 10 and 50 steps
-    4  heteroskedasticity         ACF of |mid returns| and |VWAP changes|, the share of
+    3  each stock's own VWAP      mean and spread of the VWAP's distance from the mid and
+                                  of its changes, and how much windows differ. Across
+                                  stocks (ticker_report): the share of variance explained
+                                  by the ticker, and a ticker classifier
+    4  heteroskedasticity        ACF of |mid returns| and |VWAP changes|, the share of
                                   windows where Engle's ARCH-LM test finds volatility
                                   clustering, and how much volatility differs between windows
 
@@ -36,6 +40,10 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from scipy.stats import chi2, ks_2samp, wasserstein_distance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from dataset import TICK, OrderBook
 from helpers.metrics import side_vwap
@@ -45,6 +53,10 @@ HORIZONS = (1, 10, 50)
 ACF_LAGS = 20
 ARCH_LAGS = 5
 ARCH_ALPHA = 0.05
+# Per-window summaries the ticker classifier reads; none depends on the price level.
+SUMMARY_NAMES = ("mean spread (ticks)", "mean |imbalance|", "mean VWAP distance (ticks)", "VWAP change sd (ticks)",
+                 "mean |return| (bp)", "zero-move share", "log level-1 size", "log total depth")
+CLASSIFIER_TRAIN_PER_TICKER = 200   # synthetic windows per ticker used to train the CAS classifier
 
 Features = dict[str, np.ndarray]                # per-window arrays, first axis = window
 Distance = Callable[[Features, np.ndarray, Features, np.ndarray], float]
@@ -118,17 +130,25 @@ def window_features(books: list[OrderBook]) -> Features:
     imbalance        (n, T)          level-1 queue imbalance
     vwap             (n, 2, T)       bid and ask VWAP in ticks
     vwap_change_<h>  (n, 2, T - h)   VWAP change over h steps in ticks
+    distance         (n, 2, T)       distance from the mid to the bid and ask VWAP in ticks
     returns          (n, T - 1)      mid log-returns
     arch_reject      (n,)            the ARCH-LM test rejects on the returns
     window_vol       (n,)            std of the 1-step VWAP change (bid and ask averaged)
+    window_distance  (n,)            mean VWAP distance over the window
+    summary          (n, 8)          the SUMMARY_NAMES values of each window
     """
     vwap = np.stack([np.stack([_numpy(side_vwap(b.bid_price, b.bid_size)),
                                _numpy(side_vwap(b.ask_price, b.ask_size))]) for b in books]) / TICK
-    returns = np.stack([np.diff(np.log(_numpy(b.mid))) for b in books])
+    mid = np.stack([_numpy(b.mid) for b in books])
+    returns = np.diff(np.log(mid), axis=1)
+    level1 = np.stack([_numpy((b.bid_size[:, 0] + b.ask_size[:, 0]).clamp_min(0) / 2) for b in books])
+    depth = np.stack([_numpy(b.bid_size.clamp_min(0).sum(dim=1) + b.ask_size.clamp_min(0).sum(dim=1))
+                      for b in books])
     features = {
         "spread": np.stack([np.round(_numpy(b.spread) / TICK) for b in books]),
         "imbalance": np.stack([_numpy(queue_imbalance(b)) for b in books]),
         "vwap": vwap,
+        "distance": np.stack([mid / TICK - vwap[:, 0], vwap[:, 1] - mid / TICK], axis=1),
         "returns": returns,
         "arch_reject": arch_lm_rejects(returns),
     }
@@ -136,6 +156,12 @@ def window_features(books: list[OrderBook]) -> Features:
         if h < vwap.shape[2]:
             features[f"vwap_change_{h}"] = vwap[:, :, h:] - vwap[:, :, :-h]
     features["window_vol"] = features["vwap_change_1"].std(axis=2).mean(axis=1)
+    features["window_distance"] = features["distance"].mean(axis=(1, 2))
+    features["summary"] = np.column_stack([
+        features["spread"].mean(axis=1), np.abs(features["imbalance"]).mean(axis=1), features["window_distance"],
+        features["window_vol"], np.abs(returns).mean(axis=1) * 1e4, (np.abs(np.diff(mid, axis=1)) < TICK / 4).mean(axis=1),
+        np.log1p(level1).mean(axis=1), np.log1p(depth).mean(axis=1),
+    ])
     return features
 
 
@@ -193,6 +219,13 @@ def checks(features: Features) -> dict[str, Check]:
         if f"vwap_change_{h}" in features:
             out[f"vwap_change_{h}_w1"] = Check(2, "ticks", wasserstein(f"vwap_change_{h}"))
     out["vwap_change_1_ks"] = Check(2, "KS", ks_statistic("vwap_change_1"))
+    # The dollar level of a synthetic VWAP comes from a borrowed real anchor, so
+    # point 3 compares the VWAP's distance from the mid and its changes instead.
+    for name, key, statistic in [("vwap_distance_mean", "distance", np.mean), ("vwap_distance_sd", "distance", np.std),
+                                 ("vwap_change_sd", "vwap_change_1", np.std),
+                                 ("window_distance_sd", "window_distance", np.std)]:
+        out[name] = Check(3, "ticks", statistic_gap(key, statistic),
+                          lambda f, key=key, statistic=statistic: float(statistic(f[key])))
     out |= {
         "acf_abs_return_l2": Check(4, "L2, lags 1-20", acf_gap("returns"),
                                    lambda f: window_acf(_abs_series(f, "returns", every))[0]),
@@ -244,6 +277,100 @@ def judge(train: Features, test: Features, synthetic: Features, draws: int = N_D
             report[name]["values"] = {k: float(check.value(f)) for k, f in
                                       [("real_train", train), ("real_test", test), ("synthetic", synthetic)]}
     return report
+
+
+# ---------------------------------------------------------------------------
+# Across stocks: are the tickers kept apart?
+# ---------------------------------------------------------------------------
+
+def eta_squared(groups: list[np.ndarray]) -> float:
+    """Share of the total variance that lies between the group means (0 = one shared distribution)."""
+    values = np.concatenate(groups)
+    total = ((values - values.mean()) ** 2).sum()
+    between = sum(len(g) * (g.mean() - values.mean()) ** 2 for g in groups)
+    return float(between / total) if total > 0 else 0.0
+
+
+def ticker_report(features: dict[str, dict[str, Features]], seed: int = 0) -> dict:
+    """Checks that need several tickers; features[ticker] holds real_train, real_test and synthetic.
+
+    eta_squared  for the window-mean VWAP distance and the window VWAP
+                 volatility: a model that blends the stocks pulls the
+                 synthetic value well below the real one
+    classifier   logistic regression on the SUMMARY_NAMES of each window.
+                 gan_test trains on real training windows and scores
+                 synthetic windows labelled with their ticker (Shmelkov et
+                 al., 2018); real_test is the same classifier on the real test
+                 hour, its reference. cas trains on synthetic windows and
+                 scores the real test hour (Ravuri and Vinyals, 2019). The
+                 stocks differ so much that real accuracy may be near 1: a
+                 high score shows the stocks are kept apart, the per-stock
+                 checks show whether each one matches.
+    """
+    tickers = sorted(features)
+    sources = ("real_train", "real_test", "synthetic")
+    eta = {key: {s: eta_squared([features[t][s][key] for t in tickers]) for s in sources}
+           for key in ("window_distance", "window_vol")}
+
+    def stack(source: str, cap: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        xs, ys = [], []
+        for label, t in enumerate(tickers):
+            x = features[t][source]["summary"]
+            if cap is not None and len(x) > cap:
+                x = x[rng.choice(len(x), size=cap, replace=False)]
+            xs.append(x)
+            ys.append(np.full(len(x), label))
+        return np.concatenate(xs), np.concatenate(ys)
+
+    def classifier():
+        return make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000))
+
+    real_x, real_y = stack("real_train")
+    test_x, test_y = stack("real_test")
+    fake_x, fake_y = stack("synthetic")
+    on_real = classifier().fit(real_x, real_y)
+    on_fake = classifier().fit(*stack("synthetic", CLASSIFIER_TRAIN_PER_TICKER))
+    return {
+        "tickers": tickers,
+        "eta_squared": eta,
+        "classifier": {
+            "gan_test": float(on_real.score(fake_x, fake_y)),
+            "real_test": float(on_real.score(test_x, test_y)),
+            "cas": float(on_fake.score(test_x, test_y)),
+            "confusion_synthetic": confusion_matrix(fake_y, on_real.predict(fake_x),
+                                                    labels=range(len(tickers))).tolist(),
+        },
+    }
+
+
+def ticker_tables(runs: list[tuple[str, str, dict]], across: dict | None) -> str:
+    """Markdown for point 3: each run's VWAP values next to its stock's real ones, then the across-stock checks.
+
+    runs holds (run name, ticker, judge() report) and across is a ticker_report or None.
+    """
+    names = ("vwap_distance_mean", "vwap_distance_sd", "vwap_change_sd", "window_distance_sd")
+    lines = ["**Per-stock VWAP, in ticks (real training / synthetic, verdict)**", "",
+             "| Ticker | Run | " + " | ".join(names) + " |", "|---|---|" + "---|" * len(names)]
+    for run, ticker, report in runs:
+        cells = [f"{report[n]['values']['real_train']:.2f} / {report[n]['values']['synthetic']:.2f}, "
+                 f"{report[n]['verdict']}" for n in names]
+        lines.append(f"| {ticker} | {run} | " + " | ".join(cells) + " |")
+    if across is not None:
+        eta, clf, tickers = across["eta_squared"], across["classifier"], across["tickers"]
+        lines += ["", "**Across stocks**", "",
+                  "| Measure | Real training | Real test | Synthetic |", "|---|---|---|---|"]
+        for key, label in [("window_distance", "eta² of window VWAP distance"),
+                           ("window_vol", "eta² of window VWAP volatility")]:
+            lines.append(f"| {label} | {eta[key]['real_train']:.3f} | {eta[key]['real_test']:.3f} | "
+                         f"{eta[key]['synthetic']:.3f} |")
+        lines += [f"| Ticker classifier accuracy (trained on real) | | {clf['real_test']:.3f} | {clf['gan_test']:.3f} |",
+                  f"| Ticker classifier accuracy (trained on synthetic, CAS) | | {clf['cas']:.3f} | |",
+                  "", "Confusion matrix of synthetic windows (rows: conditioned ticker, columns: predicted)", "",
+                  "| | " + " | ".join(tickers) + " |", "|---|" + "---|" * len(tickers)]
+        lines += [f"| {t} | " + " | ".join(str(c) for c in row) + " |"
+                  for t, row in zip(tickers, clf["confusion_synthetic"])]
+    return "\n".join(lines) + "\n"
 
 
 def realism_table(report: dict[str, dict], title: str) -> str:

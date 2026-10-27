@@ -21,7 +21,7 @@ import torch
 
 from helpers.audit import RunAudit, audit_run, comparison_table, print_example_book, print_summary, vwap_table
 from helpers.checkpoints import load_run
-from helpers.realism import realism_table
+from helpers.realism import realism_table, ticker_report, ticker_tables
 from helpers.plotting import (export_readme_assets, plot_autopsy, plot_volatility_acf, plot_volatility_comparison,
                               plot_vwap)
 
@@ -77,8 +77,15 @@ def write_comparison(audits: list[RunAudit], out_dir: Path) -> None:
     table_path = out_dir / "comparison.md"
     summaries = [a.summary for a in audits]
     realism = [realism_table(s["realism"], f"{s['run']} ({s['ticker']}): realism checks") for s in summaries]
-    # UTF-8 so the superscript in the header survives on Windows.
-    table_path.write_text("\n".join([comparison_table(summaries), vwap_table(summaries), *realism]),
+    # The across-stock checks need exactly one run per ticker, e.g. the five per-stock models.
+    tickers = [s["ticker"] for s in summaries]
+    across = None
+    if len(set(tickers)) == len(tickers) > 1:
+        across = ticker_report({a.summary["ticker"]: a.realism_features for a in audits})
+        (out_dir / "tickers.json").write_text(json.dumps(across, indent=1))
+    per_stock = ticker_tables([(s["run"], s["ticker"], s["realism"]) for s in summaries], across)
+    # UTF-8 so the superscripts survive on Windows.
+    table_path.write_text("\n".join([comparison_table(summaries), vwap_table(summaries), per_stock, *realism]),
                           encoding="utf-8")
     reference = audits[0].acf
     plot_volatility_comparison(reference["real_train"], reference["real_test"],
