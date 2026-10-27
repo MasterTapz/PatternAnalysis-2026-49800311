@@ -12,6 +12,13 @@ During phase 3 the samples are scored against the validation hour
 (14:00 to 15:00) and the best checkpoint is kept as best.pt. The test hour
 is only used once, after training, to score best.pt.
 
+--tickers trains one TimeGAN on several tickers. Every batch holds the same
+number of windows from each ticker, each ticker keeps its own scaling, and
+validation scores each ticker separately and averages the scores.
+--condition picks the ablation arm: full (ticker embedding, projection
+discriminator, per-ticker losses), concat (the embedding only, with pooled
+losses) or none (one unconditional model for the pooled windows).
+
 Examples (from the folder holding src/):
   python src/train.py --data-dir ../../../../data/LOBSTER
   python src/train.py --data-dir ../../../../data/LOBSTER --move-flag --static-noise-dim 8
@@ -23,6 +30,8 @@ Examples (from the folder holding src/):
   python src/train.py --data-dir ../../../../data/LOBSTER --model rgan --baseline-moment-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --ticker INTC --clock-seconds 1 --seq-len 504 \
       --eval-stride 24 --batch-size 64 --move-flag --static-noise-dim 8 --difference-weight 100 --tick-weight 2
+  python src/train.py --data-dir ../../../../data/LOBSTER --tickers AAPL AMZN GOOG INTC MSFT --condition full \
+      --clock-seconds 1 --seq-len 504 --eval-stride 24 --batch-size 65 --move-flag --static-noise-dim 8
   python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_timegan_s0 --resume
 """
 from __future__ import annotations
@@ -56,6 +65,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data = p.add_argument_group("data")
     data.add_argument("--data-dir", required=True, help="Folder holding the LOBSTER CSVs")
     data.add_argument("--ticker", choices=TICKERS, default="AMZN")
+    data.add_argument("--tickers", nargs="+", choices=TICKERS, default=None,
+                      help="Train one model on several tickers (replaces --ticker)")
+    data.add_argument("--condition", choices=("full", "concat", "none"), default="full",
+                      help="With --tickers: ticker conditioning of the model (see above)")
     data.add_argument("--representation", choices=("structured", "raw"), default="structured")
     data.add_argument("--scaling", choices=("minmax", "standard"), default="minmax")
     data.add_argument("--seq-len", type=int, default=64)
@@ -118,6 +131,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--tick-weight needs the structured encoding")
     if args.book_weight > 0 and args.representation != "raw":
         p.error("--book-weight needs the raw encoding; the structured one is valid by construction")
+    if args.tickers is not None:
+        if len(set(args.tickers)) < 2:
+            p.error("--tickers needs at least two different tickers; use --ticker for one")
+        if args.model != "timegan" or args.tick_weight > 0 or args.book_weight > 0:
+            p.error("--tickers trains TimeGAN without --tick-weight or --book-weight")
+        if args.batch_size % len(args.tickers):
+            p.error("--batch-size must be a multiple of the number of tickers")
     if args.run_name is None:
         args.run_name = default_run_name(args)
     return args
@@ -130,6 +150,24 @@ def batches(dataset: LOBWindowDataset, batch_size: int, seed: int, device: str) 
     while True:
         for x in loader:
             yield x.to(device, non_blocking=True)
+
+
+def labelled_batches(datasets: list[LOBWindowDataset], batch_size: int, seed: int,
+                     device: str) -> Iterator[tuple[torch.Tensor, torch.Tensor | None]]:
+    """Endless (windows, ticker labels) batches; labels are None for one ticker.
+
+    With several tickers every batch is stratified: batch_size / K windows
+    from each, so a stock with more windows cannot crowd out the others and
+    the per-ticker losses always have each stock to work with.
+    """
+    if len(datasets) == 1:
+        for x in batches(datasets[0], batch_size, seed, device):
+            yield x, None
+    per_ticker = batch_size // len(datasets)
+    streams = [batches(ds, per_ticker, seed + k, device) for k, ds in enumerate(datasets)]
+    labels = torch.arange(len(datasets), device=device).repeat_interleave(per_ticker)
+    while True:
+        yield torch.cat([next(s) for s in streams]), labels
 
 
 def grad_norm(params: list[torch.nn.Parameter], clip: float | None) -> float:
@@ -146,17 +184,21 @@ def as_floats(logs: dict[str, torch.Tensor], prefix: str = "") -> dict[str, floa
 # ---------------------------------------------------------------------------
 
 class Trainer:
-    """Model, optimisers, history and checkpoints of one run."""
+    """Model, optimisers, history and checkpoints of one run.
 
-    def __init__(self, args: argparse.Namespace, splits: LOBSplits, run_dir: Path):
+    splits holds one LOBSplits per ticker, in label order.
+    """
+
+    def __init__(self, args: argparse.Namespace, splits: list[LOBSplits], run_dir: Path):
         self.args, self.splits, self.run_dir = args, splits, run_dir
         self.device = args.device
-        self.model = build_model(args, len(splits.feature_names), ladder_decoder(splits),
-                                 book_penalty(splits)).to(self.device)
+        single = splits[0] if len(splits) == 1 else None
+        self.model = build_model(args, len(splits[0].feature_names), single and ladder_decoder(single),
+                                 single and book_penalty(single), num_tickers=len(splits)).to(self.device)
         self.is_timegan = isinstance(self.model, TimeGAN)
         self.optimisers = self._build_optimisers()
-        self.evaluator = Evaluator(splits, self.device, args.eval_samples, args.seed)
-        self.data = batches(splits.train, args.batch_size, args.seed, self.device)
+        self.evaluators = [Evaluator(s, self.device, args.eval_samples // len(splits), args.seed) for s in splits]
+        self.data = labelled_batches([s.train for s in splits], args.batch_size, args.seed, self.device)
         self.history = {"train": [], "val": [], "phases": {}}
         self.phase_index, self.step, self.best_score = 0, 0, float("inf")
         self._mark = (time.time(), 0)            # wall clock and step where the current timing interval began
@@ -258,12 +300,14 @@ class Trainer:
         return norm
 
     def _autoencoder_step(self) -> dict:
-        loss, logs = self.model.autoencoder_loss(next(self.data))
+        x, label = next(self.data)
+        loss, logs = self.model.autoencoder_loss(x, label=label)
         self._update("autoencoder", loss)
         return as_floats(logs)
 
     def _supervisor_step(self) -> dict:
-        loss, logs = self.model.supervisor_loss(next(self.data))
+        x, label = next(self.data)
+        loss, logs = self.model.supervisor_loss(x, label=label)
         self._update("supervisor", loss)
         return as_floats(logs)
 
@@ -274,21 +318,22 @@ class Trainer:
         """Two generator and embedder updates, then one discriminator update unless its loss is already low."""
         out: dict[str, float] = {}
         for _ in range(2):
-            x = next(self.data)
-            g_loss, g_logs = self.model.generator_loss(x)
+            x, label = next(self.data)
+            g_loss, g_logs = self.model.generator_loss(x, label=label)
             out["g_grad_norm"] = self._update("generator", g_loss)
-            e_loss, e_logs = self.model.autoencoder_loss(x, with_supervised=True)
+            e_loss, e_logs = self.model.autoencoder_loss(x, with_supervised=True, label=label)
             self._update("autoencoder", e_loss)
-        d_loss, d_logs = self.model.discriminator_loss(next(self.data))
+        x, label = next(self.data)
+        d_loss, d_logs = self.model.discriminator_loss(x, label=label)
         update = self.model.should_update_discriminator(d_loss)
         out["d_grad_norm"] = self._update("discriminator", d_loss) if update else 0.0
         out["d_updated"] = float(update)
         return {**out, **as_floats(g_logs, "g_"), **as_floats(e_logs, "e_"), **as_floats(d_logs, "d_")}
 
     def _baseline_step(self) -> dict:
-        g_loss, g_logs = self.model.generator_loss(next(self.data))
+        g_loss, g_logs = self.model.generator_loss(next(self.data)[0])
         out = {"g_grad_norm": self._update("generator", g_loss)}
-        d_loss, d_logs = self.model.discriminator_loss(next(self.data))
+        d_loss, d_logs = self.model.discriminator_loss(next(self.data)[0])
         out["d_grad_norm"] = self._update("discriminator", d_loss)
         out["d_updated"] = 1.0
         return {**out, **as_floats(g_logs, "g_"), **as_floats(d_logs, "d_")}
@@ -360,13 +405,32 @@ class Trainer:
             peak = torch.cuda.max_memory_allocated() / 2**20
             record["peak_vram_mib"] = max(record.get("peak_vram_mib", 0.0), peak)
 
+    def _validate(self, model: torch.nn.Module, phase: str) -> dict:
+        """Validation metrics, averaged over tickers, plus each ticker's score.
+
+        An unconditional model trained on several tickers gives the same kind
+        of window for every ticker; each is decoded with that ticker's scaling.
+        """
+        per_ticker = []
+        for k, evaluator in enumerate(self.evaluators):
+            with model.conditioned_on(k if model.conditional else None):
+                metrics = evaluator.reconstruction(model)
+                if phase == "joint":
+                    metrics.update(evaluator.samples(model))
+            per_ticker.append(metrics)
+        if len(per_ticker) == 1:
+            return per_ticker[0]
+        out = {key: sum(m[key] for m in per_ticker) / len(per_ticker) for key in per_ticker[0]}
+        if phase == "joint":
+            out.update({f"score_{s.config['ticker']}": m["score"] for s, m in zip(self.splits, per_ticker)})
+        return out
+
     def _evaluate(self, phase: str) -> None:
         """Validate, keep best.pt in the joint phase, then save last.pt."""
         model = self._eval_model(phase)
         model.eval()
-        metrics = self.evaluator.reconstruction(model)
+        metrics = self._validate(model, phase)
         if phase == "joint":
-            metrics.update(self.evaluator.samples(model))
             if metrics["score"] < self.best_score:
                 self.best_score = metrics["score"]
                 self.save_best(metrics["score"], model)
@@ -391,22 +455,30 @@ def main(argv: list[str] | None = None) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
 
-    splits = build_datasets(args.data_dir, ticker=args.ticker, seq_len=args.seq_len,
-                            representation=args.representation, event_stride=args.event_stride,
-                            clock_seconds=args.clock_seconds, scaling=args.scaling, eval_stride=args.eval_stride,
-                            move_flag=args.move_flag, hold_flags=args.hold_flags)
+    splits = [build_datasets(args.data_dir, ticker=ticker, seq_len=args.seq_len,
+                             representation=args.representation, event_stride=args.event_stride,
+                             clock_seconds=args.clock_seconds, scaling=args.scaling, eval_stride=args.eval_stride,
+                             move_flag=args.move_flag, hold_flags=args.hold_flags)
+              for ticker in (args.tickers or [args.ticker])]
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()
-    print(f"Run {run_dir} on {args.device}: {len(splits.train)} training windows, "
+    print(f"Run {run_dir} on {args.device}: {sum(len(s.train) for s in splits)} training windows, "
           f"parameters {trainer.model.parameter_counts()}", flush=True)
-    config = {"args": vars(args), "model": asdict(trainer.model.config), "data": splits.config}
+    data = splits[0].config if len(splits) == 1 else [s.config for s in splits]
+    config = {"args": vars(args), "model": asdict(trainer.model.config), "data": data}
     (run_dir / "config.json").write_text(json.dumps(config, indent=1))
 
     trainer.run()
     plot_history(trainer.history, run_dir / "training_curves.png")
     print(f"Saved {run_dir / 'training_curves.png'}")
-    evaluate_test(run_dir, splits, args.device, args.seed)
+    if len(splits) == 1:
+        evaluate_test(run_dir, splits[0], args.device, args.seed)
+    else:
+        for k, s in enumerate(splits):
+            ticker = s.config["ticker"]
+            print(f"\n{ticker}:")
+            evaluate_test(run_dir, s, args.device, args.seed, label=k, name=f"test_metrics_{ticker}.json")
     return run_dir
 
 

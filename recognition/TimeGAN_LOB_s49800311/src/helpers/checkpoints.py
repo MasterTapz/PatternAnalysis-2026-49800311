@@ -35,18 +35,22 @@ def default_run_name(args: argparse.Namespace) -> str:
     data is <ticker>_<clock>_T<seq_len>[_v<eval stride>], with clock 1s for a
     one-second clock or e10 for every 10th event, e.g. INTC_1s_T504_v24. It is
     left out for the original setup (AMZN, e10, T64), so the older run folders
-    keep their names. variant is timegan, nosup (no supervisor), rgan (plain
-    baseline) or rganm (baseline with the moment loss). Every option that
-    changes the results gets a suffix, so two different runs never share a folder.
+    keep their names. With --tickers, <ticker> becomes the ticker count
+    (e.g. 5stocks) and the variant gains _c<condition>. variant is timegan,
+    nosup (no supervisor), rgan (plain baseline) or rganm (baseline with the
+    moment loss). Every option that changes the results gets a suffix, so two
+    different runs never share a folder.
     """
+    tickers = getattr(args, "tickers", None)
     clock = f"{args.clock_seconds:g}s" if args.clock_seconds > 0 else f"e{args.event_stride}"
-    data = f"{args.ticker}_{clock}_T{args.seq_len}"
+    data = f"{f'{len(tickers)}stocks' if tickers else args.ticker}_{clock}_T{args.seq_len}"
     data += f"_v{args.eval_stride}" if args.eval_stride else ""
     prefix = "" if data == "AMZN_e10_T64" else f"{data}_"
     if args.model == "rgan":
         variant = "rganm" if args.baseline_moment_weight > 0 else "rgan"
     else:
         variant = "nosup" if args.no_supervisor else "timegan"
+    variant += f"_c{args.condition}" if tickers else ""
     suffix = "_paper" if args.paper_weights and args.model == "timegan" else ""
     suffix += "_std" if args.scaling == "standard" else ""
     suffix += "_mf" if args.move_flag else ""
@@ -84,12 +88,16 @@ def book_penalty(splits: LOBSplits) -> RawBookPenalty | None:
 
 
 def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks | None = None,
-                book: RawBookPenalty | None = None) -> SequenceGAN:
+                book: RawBookPenalty | None = None, num_tickers: int = 1) -> SequenceGAN:
     """TimeGAN, its ablation or the baseline, as set on the command line.
 
     ladder is the decoder TimeGAN needs for L_P (see ladder_decoder) and
-    book the penalty behind L_book (see book_penalty).
+    book the penalty behind L_book (see book_penalty). With several tickers
+    --condition sets the conditioning: full, concat or none (unconditional).
     """
+    condition = getattr(args, "condition", "full") if num_tickers > 1 else "none"
+    conditioning = {} if condition == "none" else dict(
+        num_tickers=num_tickers, projection_discriminator=condition == "full", per_ticker_losses=condition == "full")
     activation = "sigmoid" if args.scaling == "minmax" else "identity"
     if args.model == "rgan":
         return RecurrentGAN(RecurrentGANConfig(
@@ -107,6 +115,7 @@ def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks 
         change_corr_weight=args.change_corr_weight,
         tick_weight=args.tick_weight,
         book_weight=args.book_weight,
+        **conditioning,
         **(paper if args.paper_weights else {}),
     ), ladder, book)
 
@@ -120,17 +129,26 @@ def model_type(model: SequenceGAN) -> str:
 # Writing checkpoints
 # ---------------------------------------------------------------------------
 
-def run_state(model: SequenceGAN, splits: LOBSplits, args: argparse.Namespace) -> dict:
-    """The part of every checkpoint that describes the model and its data."""
-    return {
+def run_state(model: SequenceGAN, splits: list[LOBSplits], args: argparse.Namespace) -> dict:
+    """The part of every checkpoint that describes the model and its data.
+
+    The first ticker's scaler and data settings sit where single-ticker
+    checkpoints keep them. A run on several tickers also lists the tickers
+    in label order with their scalers.
+    """
+    state = {
         "model": model.state_dict(),
         "model_type": model_type(model),
         "model_config": asdict(model.config),
-        "scaler": splits.scaler.state_dict(),
-        "data_config": splits.config,
-        "feature_names": splits.feature_names,
+        "scaler": splits[0].scaler.state_dict(),
+        "data_config": splits[0].config,
+        "feature_names": splits[0].feature_names,
         "args": vars(args),
     }
+    if len(splits) > 1:
+        state["tickers"] = [s.config["ticker"] for s in splits]
+        state["ticker_scalers"] = [s.scaler.state_dict() for s in splits]
+    return state
 
 
 def rng_state() -> dict:
@@ -180,8 +198,8 @@ def model_from_state(state: dict, device: str) -> SequenceGAN:
     return model.eval()
 
 
-def splits_from_state(state: dict, data_dir: str) -> LOBSplits:
-    """Rebuild the data pipeline a checkpoint was trained on.
+def splits_from_state(state: dict, data_dir: str, ticker: str | None = None) -> LOBSplits:
+    """Rebuild the data pipeline a checkpoint was trained on, for one of its tickers.
 
     Settings the checkpoint does not have (such as move_flag in older runs)
     keep the build_datasets defaults.
@@ -189,11 +207,13 @@ def splits_from_state(state: dict, data_dir: str) -> LOBSplits:
     wanted = inspect.signature(build_datasets).parameters
     config = {k: v for k, v in state["data_config"].items() if k in wanted}
     config["data_dir"] = data_dir
+    if ticker is not None:
+        config["ticker"] = ticker
     return build_datasets(**config)
 
 
-def load_run(run_dir: Path, data_dir: str, device: str) -> tuple[SequenceGAN, LOBSplits, dict]:
-    """The best model of a run, its data splits and the raw checkpoint."""
+def load_run(run_dir: Path, data_dir: str, device: str) -> tuple[SequenceGAN, list[LOBSplits], dict]:
+    """The best model of a run, one data pipeline per ticker in label order, and the raw checkpoint."""
     state = load_checkpoint(best_checkpoint(run_dir), device)
-    splits = splits_from_state(state, data_dir)
+    splits = [splits_from_state(state, data_dir, ticker) for ticker in state.get("tickers", [None])]
     return model_from_state(state, device), splits, state

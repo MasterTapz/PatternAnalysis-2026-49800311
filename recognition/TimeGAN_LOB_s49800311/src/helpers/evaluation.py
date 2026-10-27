@@ -76,12 +76,14 @@ def timed_sample(model: SequenceGAN, n: int, seq_len: int, device: str) -> tuple
 
 
 @torch.no_grad()
-def evaluate_test(run_dir: Path, splits: LOBSplits, device: str, seed: int, n_samples: int = 1024) -> dict:
-    """Score best.pt on the test hour and write test_metrics.json.
+def evaluate_test(run_dir: Path, splits: LOBSplits, device: str, seed: int, n_samples: int = 1024,
+                  label: int | None = None, name: str = "test_metrics.json") -> dict:
+    """Score best.pt on the test hour and write <run>/<name>.
 
     The real-vs-real KL floors are included, since no generator can be
     expected to beat them. Sampling uses seed + 1, so the numbers differ
-    slightly from predict.py, which uses seed.
+    slightly from predict.py, which uses seed. label is the ticker index of
+    a conditional model, whose splits are that ticker's.
     """
     checkpoint = best_checkpoint(run_dir)
     state = load_checkpoint(checkpoint, device)
@@ -91,13 +93,15 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, device: str, seed: int, n_sa
     test_x, test_anchor, test_books = decode_real_windows(splits, splits.test)
 
     torch.manual_seed(seed + 1)
-    fake_x, sample_seconds = timed_sample(model, n_samples, splits.test.seq_len, device)
+    with model.conditioned_on(label if model.conditional else None):
+        fake_x, sample_seconds = timed_sample(model, n_samples, splits.test.seq_len, device)
+        recon_mse = reconstruction_mse(model, test_x.to(device)) if isinstance(model, TimeGAN) else None
     fake = decode_synthetic_windows(splits, fake_x, test_anchor, torch.Generator().manual_seed(seed))
 
     report = {
         "checkpoint": checkpoint.name,
         "checkpoint_phase_step": [PHASES[min(state["phase_index"], 2)], state["step"]],
-        "test_recon_mse": reconstruction_mse(model, test_x.to(device)) if isinstance(model, TimeGAN) else None,
+        "test_recon_mse": recon_mse,
         "violations": book_violations(fake),
         "vs_test_hour": distribution_report(test_books, fake),
         "vs_training_reference": distribution_report(references.train_books, fake),
@@ -107,7 +111,7 @@ def evaluate_test(run_dir: Path, splits: LOBSplits, device: str, seed: int, n_sa
         "sampling": {"sequences": n_samples, "seconds": sample_seconds,
                      "sequences_per_second": n_samples / max(sample_seconds, 1e-9)},
     }
-    (run_dir / "test_metrics.json").write_text(json.dumps(report, indent=1))
+    (run_dir / name).write_text(json.dumps(report, indent=1))
     print_test_report(report, n_real=len(test_books))
     return report
 
