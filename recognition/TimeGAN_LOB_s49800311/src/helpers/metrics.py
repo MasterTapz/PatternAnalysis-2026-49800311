@@ -21,7 +21,7 @@ KL_TARGET = 0.1   # spec target for KL(real || synthetic) of spreads and returns
 # ---------------------------------------------------------------------------
 
 def decode_windows(windows: torch.Tensor, scaler: FeatureScaler, anchors: torch.Tensor,
-                   representation: str, move_flag: bool = False) -> list[OrderBook]:
+                   representation: str, move_flag: bool = False, hold_flags: bool = False) -> list[OrderBook]:
     """Unscale and decode windows (B, T, F) into B books.
 
     anchors[i] is the mid-price before window i. Synthetic windows borrow
@@ -29,7 +29,7 @@ def decode_windows(windows: torch.Tensor, scaler: FeatureScaler, anchors: torch.
     """
     features = scaler.inverse_transform(windows.detach().cpu())
     anchors = torch.as_tensor(anchors, dtype=torch.float64)
-    return [decode_book(features[i], anchors[i], representation, move_flag=move_flag)
+    return [decode_book(features[i], anchors[i], representation, move_flag=move_flag, hold_flags=hold_flags)
             for i in range(len(features))]
 
 
@@ -37,7 +37,8 @@ def decode_real_windows(splits: LOBSplits, dataset: LOBWindowDataset, indices: I
                         ) -> tuple[torch.Tensor, torch.Tensor, list[OrderBook]]:
     """Real windows (n, T, F), their anchors (n,) and the decoded books."""
     windows, anchors = dataset.stack(indices)
-    books = decode_windows(windows, splits.scaler, anchors, splits.representation, splits.move_flag)
+    books = decode_windows(windows, splits.scaler, anchors, splits.representation, splits.move_flag,
+                           splits.hold_flags)
     return windows, anchors, books
 
 
@@ -45,7 +46,8 @@ def decode_synthetic_windows(splits: LOBSplits, windows: torch.Tensor, real_anch
                              generator: torch.Generator) -> list[OrderBook]:
     """Decode generated windows, each at a randomly drawn real anchor."""
     pick = torch.randint(len(real_anchors), (len(windows),), generator=generator)
-    return decode_windows(windows, splits.scaler, real_anchors[pick], splits.representation, splits.move_flag)
+    return decode_windows(windows, splits.scaler, real_anchors[pick], splits.representation, splits.move_flag,
+                          splits.hold_flags)
 
 
 # ---------------------------------------------------------------------------

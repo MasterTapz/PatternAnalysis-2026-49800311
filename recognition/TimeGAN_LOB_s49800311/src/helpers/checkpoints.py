@@ -30,7 +30,7 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>][_bw<w>]_s<seed>.
+    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_hf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>][_bw<w>]_s<seed>.
 
     data is <ticker>_<clock>_T<seq_len>[_v<eval stride>], with clock 1s for a
     one-second clock or e10 for every 10th event, e.g. INTC_1s_T504_v24. It is
@@ -50,6 +50,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix = "_paper" if args.paper_weights and args.model == "timegan" else ""
     suffix += "_std" if args.scaling == "standard" else ""
     suffix += "_mf" if args.move_flag else ""
+    suffix += "_hf" if args.hold_flags else ""
     suffix += "_ema" if args.ema_decay > 0 else ""
     suffix += f"_sn{args.static_noise_dim}" if args.static_noise_dim > 0 and args.model == "timegan" else ""
     suffix += f"_dw{args.difference_weight:g}" if args.difference_weight > 0 and args.model == "timegan" else ""

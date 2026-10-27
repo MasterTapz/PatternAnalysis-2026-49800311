@@ -197,9 +197,17 @@ def split_by_time(time: torch.Tensor, train_end: str = "14:00", val_end: str = "
 # half of the real steps have no mid move, and a generator with continuous
 # outputs almost never lands on exactly zero, so the flag lets the model
 # decide "move or not" separately from the size of the move.
+#
+# hold_flags=True adds binary "bid_unchanged" and "ask_unchanged" columns
+# after that, which are 1 when every price and size on that side equals the
+# previous step's. On a one-second clock a third of the real side-steps do not
+# change at all, which continuous outputs never reproduce: generated books
+# then jitter at every step and spring back. The decoder copies a flagged
+# side from the last step where it was not flagged.
 # ---------------------------------------------------------------------------
 
-def feature_names(representation: str = "structured", levels: int = 10, move_flag: bool = False) -> list[str]:
+def feature_names(representation: str = "structured", levels: int = 10, move_flag: bool = False,
+                  hold_flags: bool = False) -> list[str]:
     if representation == "structured":
         prices = ["log_spread_ticks"]
         prices += [f"log_ask_gap_{k}_{k + 1}" for k in range(1, levels)]
@@ -211,17 +219,23 @@ def feature_names(representation: str = "structured", levels: int = 10, move_fla
         raise ValueError(f"representation must be one of {REPRESENTATIONS}")
     sizes = [f"log1p_ask_size_{k}" for k in range(1, levels + 1)]
     sizes += [f"log1p_bid_size_{k}" for k in range(1, levels + 1)]
-    flag = ["mid_moved"] if move_flag else []
-    return ["mid_log_return"] + flag + prices + sizes
+    flags = ["mid_moved"] if move_flag else []
+    flags += ["bid_unchanged", "ask_unchanged"] if hold_flags else []
+    return ["mid_log_return"] + flags + prices + sizes
 
 
-def encode_book(book: OrderBook, representation: str = "structured", move_flag: bool = False) -> torch.Tensor:
+def encode_book(book: OrderBook, representation: str = "structured", move_flag: bool = False,
+                hold_flags: bool = False) -> torch.Tensor:
     """Features of book rows 1..N-1, shape (N - 1, F), float64."""
     mid = book.mid
     columns = [(torch.log(mid[1:]) - torch.log(mid[:-1]))[:, None]]
     if move_flag:
         moved = torch.round(torch.diff(mid) / HALF_TICK) != 0
         columns.append(moved.double()[:, None])
+    if hold_flags:
+        for price, size in [(book.bid_price, book.bid_size), (book.ask_price, book.ask_size)]:
+            unchanged = ((price[1:] == price[:-1]) & (size[1:] == size[:-1])).all(dim=1)
+            columns.append(unchanged.double()[:, None])
     ask, bid = book.ask_price[1:], book.bid_price[1:]
 
     if representation == "structured":
@@ -275,6 +289,27 @@ def _parity_spread(spread_ticks: torch.Tensor, mid: torch.Tensor) -> torch.Tenso
     return torch.where(nearest < 1, nearest + 2, nearest)
 
 
+def _hold_sides(book: OrderBook, held: torch.Tensor) -> OrderBook:
+    """Copy each side flagged as unchanged (held, (T, 2) for bid and ask) from its last unflagged step.
+
+    The first step is never held, since the book before the window is
+    unknown. A copied side that would meet or cross the other side is
+    released for that step, so both sides then come from the same step.
+    """
+    steps = torch.arange(len(book))
+    held = held.clone()
+    held[0] = False
+
+    def last_free(h: torch.Tensor) -> torch.Tensor:
+        return torch.cummax(torch.where(h, torch.zeros_like(steps), steps), dim=0).values
+
+    bid, ask = last_free(held[:, 0]), last_free(held[:, 1])
+    crossed = book.bid_price[bid, 0] >= book.ask_price[ask, 0]
+    bid, ask = torch.where(crossed, steps, bid), torch.where(crossed, steps, ask)
+    return OrderBook(time=book.time, ask_price=book.ask_price[ask], ask_size=book.ask_size[ask],
+                     bid_price=book.bid_price[bid], bid_size=book.bid_size[bid])
+
+
 def decode_book(
     features: torch.Tensor,
     prev_mid: torch.Tensor | float,
@@ -282,6 +317,7 @@ def decode_book(
     levels: int = 10,
     round_to_tick: bool = True,
     move_flag: bool = False,
+    hold_flags: bool = False,
 ) -> OrderBook:
     """Inverse of encode_book for one sequence of shape (T, F).
 
@@ -289,11 +325,13 @@ def decode_book(
     crossed books, negative sizes and repeated levels are kept for the audit.
     """
     f = features.double()
-    if f.dim() != 2 or f.shape[1] != len(feature_names(representation, levels, move_flag)):
+    if f.dim() != 2 or f.shape[1] != len(feature_names(representation, levels, move_flag, hold_flags)):
         raise ValueError("features must have shape (T, F) for the given representation")
+    n_flags = int(move_flag) + 2 * int(hold_flags)
+    flags = f[:, 1:1 + n_flags]
+    f = torch.cat([f[:, :1], f[:, 1 + n_flags:]], dim=1)     # drop the flag columns
     if move_flag:
-        mid = _flagged_mid_path(f[:, 0], f[:, 1], float(prev_mid), round_to_tick)
-        f = torch.cat([f[:, :1], f[:, 2:]], dim=1)     # drop the flag column
+        mid = _flagged_mid_path(f[:, 0], flags[:, 0], float(prev_mid), round_to_tick)
     else:
         mid = torch.as_tensor(prev_mid, dtype=torch.float64) * torch.exp(torch.cumsum(f[:, 0], dim=0))
 
@@ -322,13 +360,14 @@ def decode_book(
         raise ValueError(f"representation must be one of {REPRESENTATIONS}")
 
     sizes = torch.expm1(f[:, size_start:])
-    return OrderBook(
+    book = OrderBook(
         time=torch.arange(f.shape[0], dtype=torch.float64),
         ask_price=ask_price,
         ask_size=sizes[:, :levels],
         bid_price=bid_price,
         bid_size=sizes[:, levels:],
     )
+    return _hold_sides(book, flags[:, -2:] >= 0.5) if hold_flags else book
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +489,10 @@ class LOBSplits:
     def move_flag(self) -> bool:
         return self.config["move_flag"]
 
+    @property
+    def hold_flags(self) -> bool:
+        return self.config["hold_flags"]
+
 
 def build_datasets(
     data_dir: str | Path,
@@ -466,6 +509,7 @@ def build_datasets(
     train_stride: int = 1,
     eval_stride: int | None = None,
     move_flag: bool = False,
+    hold_flags: bool = False,
 ) -> LOBSplits:
     """Run the whole pipeline and return the three windowed periods.
 
@@ -485,7 +529,7 @@ def build_datasets(
         book = sample_clock(book, clock_seconds, *session_bounds(open_minutes, close_minutes))
     else:
         book = subsample_events(trim_session(book, open_minutes, close_minutes), event_stride)
-    features = encode_book(book, representation, move_flag)
+    features = encode_book(book, representation, move_flag, hold_flags)
     prev_mid = book.mid[:-1]
     time = book.time[1:]
     parts = split_by_time(time, train_end, val_end)
@@ -502,6 +546,6 @@ def build_datasets(
         val=window("val", eval_stride),
         test=window("test", eval_stride),
         scaler=scaler,
-        feature_names=feature_names(representation, book.levels, move_flag),
+        feature_names=feature_names(representation, book.levels, move_flag, hold_flags),
         config=config,
     )

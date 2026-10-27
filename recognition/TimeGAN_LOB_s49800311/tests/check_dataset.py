@@ -47,33 +47,55 @@ def clock_check(data_dir: str, ticker: str, clock_seconds: float) -> None:
           f"2000 random rows match the last event before them, mid unchanged on {unchanged:.1%} of steps")
 
 
+FLAG_SETTINGS = [(False, False), (True, False), (True, True)]   # (move_flag, hold_flags)
+
+
 def round_trip_check(data_dir: str, ticker: str, seq_len: int, clock_seconds: float) -> None:
     """Encoding then decoding real books must give them back exactly, in every encoding."""
     book = sampled_book(data_dir, ticker, clock_seconds)
     target = book.select(slice(1, None))
     for representation in REPRESENTATIONS:
-        for move_flag in (False, True):
-            x = encode_book(book, representation, move_flag)
-            worst = 0.0
+        for move_flag, hold_flags in FLAG_SETTINGS:
+            x = encode_book(book, representation, move_flag, hold_flags)
+            worst, worst_size = 0.0, 0.0
             for s in range(0, len(x), seq_len):
-                d = decode_book(x[s:s + seq_len], book.mid[s], representation, move_flag=move_flag)
+                d = decode_book(x[s:s + seq_len], book.mid[s], representation, move_flag=move_flag,
+                                hold_flags=hold_flags)
                 t = target.select(slice(s, s + seq_len))
                 worst = max(worst,
                             (d.ask_price - t.ask_price).abs().max().item(),
                             (d.bid_price - t.bid_price).abs().max().item(),
                             (d.mid - t.mid).abs().max().item())
-            assert worst < 1e-9, f"{representation} move_flag={move_flag}: round trip off by {worst}"
-            print(f"  round trip {representation:10s} move_flag={move_flag!s:5s}: "
-                  f"max price error {worst:.1e} dollars")
+                worst_size = max(worst_size, (d.ask_size - t.ask_size).abs().max().item(),
+                                 (d.bid_size - t.bid_size).abs().max().item())
+            label = f"{representation} move_flag={move_flag} hold_flags={hold_flags}"
+            assert worst < 1e-9, f"{label}: round trip off by {worst} dollars"
+            assert worst_size < 1e-6, f"{label}: round trip off by {worst_size} shares"
+            print(f"  round trip {representation:10s} move_flag={move_flag!s:5s} hold_flags={hold_flags!s:5s}: "
+                  f"max price error {worst:.1e} dollars, size error {worst_size:.1e} shares")
+    unchanged = encode_book(book, "structured", True, True)[:, 2:4].mean(dim=0)
+    print(f"  real side-steps with no change at all: bid {unchanged[0]:.3f}, ask {unchanged[1]:.3f}")
+
+
+def hold_check(splits) -> None:
+    """Any hold flags at all, here random ones, must still decode a scaled real window to a valid book."""
+    x = splits.scaler.inverse_transform(splits.test[0]).clone()
+    columns = [splits.feature_names.index("bid_unchanged"), splits.feature_names.index("ask_unchanged")]
+    x[:, columns] = torch.rand(len(x), 2, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    d = decode_book(x, splits.test.anchor(0), splits.representation, move_flag=splits.move_flag, hold_flags=True)
+    held = float((x[:, columns] >= 0.5).double().mean())
+    assert bool((d.ask_price[:, 0] > d.bid_price[:, 0]).all()), "held sides decoded crossed"
+    assert bool((d.ask_price.diff(dim=1) > 0).all() and (d.bid_price.diff(dim=1) < 0).all())
+    print(f"  random hold flags ({held:.0%} of side-steps held) still decode to a valid book")
 
 
 def split_check(data_dir: str, ticker: str, seq_len: int, clock_seconds: float, representation: str,
-                move_flag: bool) -> None:
+                move_flag: bool, hold_flags: bool) -> None:
     """The splits are in time order, and a scaled real window decodes to a valid book."""
     splits = build_datasets(data_dir, ticker=ticker, seq_len=seq_len, clock_seconds=clock_seconds,
-                            representation=representation, move_flag=move_flag)
-    print(f"\n[{ticker}, {representation}, move_flag={move_flag}] {len(splits.feature_names)} features, "
-          f"config {splits.config}")
+                            representation=representation, move_flag=move_flag, hold_flags=hold_flags)
+    print(f"\n[{ticker}, {representation}, move_flag={move_flag}, hold_flags={hold_flags}] "
+          f"{len(splits.feature_names)} features, config {splits.config}")
 
     for name in ("train", "val", "test"):
         ds = getattr(splits, name)
@@ -86,11 +108,14 @@ def split_check(data_dir: str, ticker: str, seq_len: int, clock_seconds: float, 
     assert splits.train[0].shape == (seq_len, len(splits.feature_names))
 
     ds = splits.test
-    decoded = decode_book(splits.scaler.inverse_transform(ds[0]), ds.anchor(0), representation, move_flag=move_flag)
+    decoded = decode_book(splits.scaler.inverse_transform(ds[0]), ds.anchor(0), representation, move_flag=move_flag,
+                          hold_flags=hold_flags)
     assert bool((decoded.ask_price[:, 0] > decoded.bid_price[:, 0]).all()), "real window decoded crossed"
     assert bool((decoded.ask_price.diff(dim=1) > 0).all() and (decoded.bid_price.diff(dim=1) < 0).all())
     print(f"  first test window decodes to a valid book, best bid/ask "
           f"{decoded.bid_price[0, 0]:.2f}/{decoded.ask_price[0, 0]:.2f}")
+    if hold_flags and representation == "structured":
+        hold_check(splits)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -108,8 +133,9 @@ def main(argv: list[str] | None = None) -> None:
         print("Exact round trip of every encoding on the real session:")
         round_trip_check(args.data_dir, ticker, args.seq_len, args.clock_seconds)
         for representation in REPRESENTATIONS:
-            for move_flag in (False, True):
-                split_check(args.data_dir, ticker, args.seq_len, args.clock_seconds, representation, move_flag)
+            for move_flag, hold_flags in FLAG_SETTINGS:
+                split_check(args.data_dir, ticker, args.seq_len, args.clock_seconds, representation, move_flag,
+                            hold_flags)
     print("\nAll checks passed.")
 
 

@@ -66,6 +66,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--eval-stride", type=int, default=None,
                       help="Step between validation and test windows, e.g. 24 (default: --seq-len, no overlap)")
     data.add_argument("--move-flag", action="store_true", help="Add a binary mid-moved feature")
+    data.add_argument("--hold-flags", action="store_true",
+                      help="Add binary bid-unchanged and ask-unchanged features; a flagged side repeats when decoded")
 
     model = p.add_argument_group("model")
     model.add_argument("--model", choices=tuple(MODELS), default="timegan", help="timegan, or rgan for the baseline")
@@ -392,7 +394,7 @@ def main(argv: list[str] | None = None) -> Path:
     splits = build_datasets(args.data_dir, ticker=args.ticker, seq_len=args.seq_len,
                             representation=args.representation, event_stride=args.event_stride,
                             clock_seconds=args.clock_seconds, scaling=args.scaling, eval_stride=args.eval_stride,
-                            move_flag=args.move_flag)
+                            move_flag=args.move_flag, hold_flags=args.hold_flags)
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()

@@ -307,7 +307,8 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
         # generator could do through this latent space.
         recon_x = model.reconstruct(test_x.to(device)).cpu()
         vwap_sources["reconstructed_test"] = decode_windows(recon_x, splits.scaler, test_anchor,
-                                                            splits.representation, splits.move_flag)
+                                                            splits.representation, splits.move_flag,
+                                                            splits.hold_flags)
     # The realism yardsticks need non-overlapping windows on the real side.
     realism_features = {"real_train": window_features(train_books),
                         "real_test": window_features([real_books[i] for i in splits.test.disjoint_indices()]),
