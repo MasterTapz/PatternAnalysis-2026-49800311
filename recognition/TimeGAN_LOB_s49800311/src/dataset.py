@@ -1,9 +1,11 @@
-"""Loading and preprocessing of the LOBSTER AMZN level 10 sample.
+"""Loading and preprocessing of the LOBSTER level 10 samples.
 
-LOBSTER ships two CSVs without headers: a message file (one row per event)
+LOBSTER's free samples cover AAPL, AMZN, GOOG, INTC and MSFT on 21 June 2012.
+Each ticker ships two CSVs without headers: a message file (one row per event)
 and an order book file whose row i is the book right after message i. Each
 book row holds ask price, ask size, bid price and bid size for levels 1 to
-10, with prices in dollars times 10,000.
+10, with prices in dollars times 10,000. A ticker's files can sit in the data
+folder itself or in a subfolder named after the ticker.
 
 The pipeline is load -> trim -> subsample -> encode -> split -> scale -> window,
 and the train, validation and test periods stay in time order.
@@ -20,7 +22,7 @@ import torch
 from torch.utils.data import Dataset
 
 PRICE_SCALE = 10_000             # LOBSTER prices are dollars times 10,000
-TICK = 0.01                      # AMZN tick size in dollars
+TICK = 0.01                      # tick size in dollars, the same for all five tickers
 HALF_TICK = TICK / 2             # smallest possible mid-price move
 EMPTY_ASK = 9_999_999_999        # LOBSTER placeholder for an empty ask level
 EMPTY_BID = -9_999_999_999       # LOBSTER placeholder for an empty bid level
@@ -28,6 +30,7 @@ HALT_EVENT = 7                   # message type of a trading halt
 MARKET_OPEN = 9.5 * 3600         # 09:30 in seconds after midnight
 MARKET_CLOSE = 16 * 3600         # 16:00 in seconds after midnight
 REPRESENTATIONS = ("structured", "raw")
+TICKERS = ("AAPL", "AMZN", "GOOG", "INTC", "MSFT")
 
 
 def clock_to_seconds(hhmm: str) -> float:
@@ -79,22 +82,25 @@ class OrderBook:
 # Loading and splitting
 # ---------------------------------------------------------------------------
 
-def _find_one(data_dir: Path, pattern: str) -> Path:
-    matches = sorted(data_dir.glob(pattern))
+def _find_one(data_dir: Path, ticker: str, pattern: str) -> Path:
+    """The one file matching pattern in data_dir or data_dir/ticker."""
+    matches = sorted(data_dir.glob(pattern)) + sorted((data_dir / ticker).glob(pattern))
     if len(matches) != 1:
-        raise FileNotFoundError(f"Expected one file matching {pattern!r} in {data_dir}, found {len(matches)}")
+        raise FileNotFoundError(f"Expected one file matching {pattern!r} in {data_dir} or its {ticker} "
+                                f"folder, found {len(matches)}")
     return matches[0]
 
 
-def load_lobster(data_dir: str | Path, levels: int = 10) -> OrderBook:
-    """Read the message and order book files of one LOBSTER day.
+def load_lobster(data_dir: str | Path, ticker: str = "AMZN", levels: int = 10) -> OrderBook:
+    """Read the message and order book files of one ticker's LOBSTER day.
 
     Only the timestamps come from the message file. Empty levels and trading
-    halts raise an error instead of being patched; the AMZN sample has neither.
+    halts raise an error instead of being patched; none of the five samples
+    has either.
     """
     data_dir = Path(data_dir)
-    message_path = _find_one(data_dir, f"*_message_{levels}.csv")
-    book_path = _find_one(data_dir, f"*_orderbook_{levels}.csv")
+    message_path = _find_one(data_dir, ticker, f"{ticker}_*_message_{levels}.csv")
+    book_path = _find_one(data_dir, ticker, f"{ticker}_*_orderbook_{levels}.csv")
 
     messages = pd.read_csv(message_path, header=None, usecols=[0, 1], names=["time", "type"])
     book = torch.tensor(pd.read_csv(book_path, header=None).to_numpy(), dtype=torch.int64)
@@ -424,6 +430,7 @@ class LOBSplits:
 
 def build_datasets(
     data_dir: str | Path,
+    ticker: str = "AMZN",
     seq_len: int = 64,
     representation: str = "structured",
     event_stride: int = 10,
@@ -447,7 +454,7 @@ def build_datasets(
     config["data_dir"] = str(data_dir)
     config["eval_stride"] = eval_stride = eval_stride or seq_len
 
-    book = subsample_events(trim_session(load_lobster(data_dir), open_minutes, close_minutes), event_stride)
+    book = subsample_events(trim_session(load_lobster(data_dir, ticker), open_minutes, close_minutes), event_stride)
     features = encode_book(book, representation, move_flag)
     prev_mid = book.mid[:-1]
     time = book.time[1:]

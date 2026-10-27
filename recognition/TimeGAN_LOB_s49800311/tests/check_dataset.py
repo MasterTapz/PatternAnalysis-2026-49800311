@@ -5,6 +5,7 @@ be in time order, and a scaled real test window must decode to a valid book.
 
 Run from the folder holding src/ and tests/:
   python tests/check_dataset.py --data-dir ../../../../data/LOBSTER
+  python tests/check_dataset.py --data-dir ../../../../data/LOBSTER --tickers AAPL AMZN GOOG INTC MSFT
 """
 from __future__ import annotations
 
@@ -14,13 +15,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from dataset import (REPRESENTATIONS, build_datasets, decode_book, encode_book, load_lobster,  # noqa: E402
-                     subsample_events, trim_session)
+from dataset import (REPRESENTATIONS, TICKERS, build_datasets, decode_book, encode_book,  # noqa: E402
+                     load_lobster, subsample_events, trim_session)
 
 
-def round_trip_check(data_dir: str, seq_len: int) -> None:
+def round_trip_check(data_dir: str, ticker: str, seq_len: int) -> None:
     """Encoding then decoding real books must give them back exactly, in every encoding."""
-    book = subsample_events(trim_session(load_lobster(data_dir)), 10)
+    book = subsample_events(trim_session(load_lobster(data_dir, ticker)), 10)
     target = book.select(slice(1, None))
     for representation in REPRESENTATIONS:
         for move_flag in (False, True):
@@ -38,10 +39,12 @@ def round_trip_check(data_dir: str, seq_len: int) -> None:
                   f"max price error {worst:.1e} dollars")
 
 
-def split_check(data_dir: str, seq_len: int, representation: str, move_flag: bool) -> None:
+def split_check(data_dir: str, ticker: str, seq_len: int, representation: str, move_flag: bool) -> None:
     """The splits are in time order, and a scaled real window decodes to a valid book."""
-    splits = build_datasets(data_dir, seq_len=seq_len, representation=representation, move_flag=move_flag)
-    print(f"\n[{representation}, move_flag={move_flag}] {len(splits.feature_names)} features, config {splits.config}")
+    splits = build_datasets(data_dir, ticker=ticker, seq_len=seq_len, representation=representation,
+                            move_flag=move_flag)
+    print(f"\n[{ticker}, {representation}, move_flag={move_flag}] {len(splits.feature_names)} features, "
+          f"config {splits.config}")
 
     for name in ("train", "val", "test"):
         ds = getattr(splits, name)
@@ -64,14 +67,16 @@ def split_check(data_dir: str, seq_len: int, representation: str, move_flag: boo
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Build the LOBSTER datasets and run sanity checks.")
     parser.add_argument("--data-dir", required=True, help="Folder holding the LOBSTER message and orderbook CSVs")
+    parser.add_argument("--tickers", nargs="+", choices=TICKERS, default=["AMZN"])
     parser.add_argument("--seq-len", type=int, default=64)
     args = parser.parse_args(argv)
 
-    print("Exact round trip of every encoding on the real session:")
-    round_trip_check(args.data_dir, args.seq_len)
-    for representation in REPRESENTATIONS:
-        for move_flag in (False, True):
-            split_check(args.data_dir, args.seq_len, representation, move_flag)
+    for ticker in args.tickers:
+        print(f"\n=== {ticker} ===\nExact round trip of every encoding on the real session:")
+        round_trip_check(args.data_dir, ticker, args.seq_len)
+        for representation in REPRESENTATIONS:
+            for move_flag in (False, True):
+                split_check(args.data_dir, ticker, args.seq_len, representation, move_flag)
     print("\nAll checks passed.")
 
 

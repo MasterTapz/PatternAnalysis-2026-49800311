@@ -20,6 +20,7 @@ Examples (from the folder holding src/):
       --change-corr-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --no-supervisor
   python src/train.py --data-dir ../../../../data/LOBSTER --model rgan --baseline-moment-weight 100
+  python src/train.py --data-dir ../../../../data/LOBSTER --ticker INTC --move-flag --static-noise-dim 8
   python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_timegan_s0 --resume
 """
 from __future__ import annotations
@@ -35,7 +36,7 @@ import torch
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
-from dataset import LOBSplits, LOBWindowDataset, build_datasets
+from dataset import TICKERS, LOBSplits, LOBWindowDataset, build_datasets
 from helpers.checkpoints import (BEST_CHECKPOINT, LAST_CHECKPOINT, MODELS, PHASES, build_model, default_run_name,
                                  ladder_decoder, load_checkpoint, restore_rng_state, resumed_args, rng_state,
                                  run_state)
@@ -52,6 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     data = p.add_argument_group("data")
     data.add_argument("--data-dir", required=True, help="Folder holding the LOBSTER CSVs")
+    data.add_argument("--ticker", choices=TICKERS, default="AMZN")
     data.add_argument("--representation", choices=("structured", "raw"), default="structured")
     data.add_argument("--scaling", choices=("minmax", "standard"), default="minmax")
     data.add_argument("--seq-len", type=int, default=64)
@@ -374,8 +376,9 @@ def main(argv: list[str] | None = None) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
 
-    splits = build_datasets(args.data_dir, seq_len=args.seq_len, representation=args.representation,
-                            event_stride=args.event_stride, scaling=args.scaling, move_flag=args.move_flag)
+    splits = build_datasets(args.data_dir, ticker=args.ticker, seq_len=args.seq_len,
+                            representation=args.representation, event_stride=args.event_stride,
+                            scaling=args.scaling, move_flag=args.move_flag)
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()
