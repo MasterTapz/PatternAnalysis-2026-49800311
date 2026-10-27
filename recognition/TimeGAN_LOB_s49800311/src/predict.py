@@ -21,6 +21,7 @@ import torch
 
 from helpers.audit import RunAudit, audit_run, comparison_table, print_example_book, print_summary, vwap_table
 from helpers.checkpoints import load_run
+from helpers.realism import realism_table
 from helpers.plotting import (export_readme_assets, plot_autopsy, plot_volatility_acf, plot_volatility_comparison,
                               plot_vwap)
 
@@ -75,8 +76,10 @@ def write_comparison(audits: list[RunAudit], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     table_path = out_dir / "comparison.md"
     summaries = [a.summary for a in audits]
+    realism = [realism_table(s["realism"], f"{s['run']} ({s['ticker']}): realism checks") for s in summaries]
     # UTF-8 so the superscript in the header survives on Windows.
-    table_path.write_text(comparison_table(summaries) + "\n" + vwap_table(summaries), encoding="utf-8")
+    table_path.write_text("\n".join([comparison_table(summaries), vwap_table(summaries), *realism]),
+                          encoding="utf-8")
     reference = audits[0].acf
     plot_volatility_comparison(reference["real_train"], reference["real_test"],
                                {a.summary["run"]: a.acf["synthetic"] for a in audits},

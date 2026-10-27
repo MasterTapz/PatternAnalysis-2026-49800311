@@ -429,8 +429,8 @@ class LOBWindowDataset(Dataset):
         return windows, anchors
 
     def disjoint_indices(self) -> range:
-        """Non-overlapping windows, used for reference sets taken from training data."""
-        return range(0, len(self), self.seq_len)
+        """Indices of non-overlapping windows, for reference sets and the realism checks."""
+        return range(0, len(self), math.ceil(self.seq_len / self.stride))
 
 
 @dataclass

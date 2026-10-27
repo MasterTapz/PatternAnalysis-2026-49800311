@@ -11,7 +11,8 @@ achievable:
     VWAP            distance from the mid, step changes, their clustering,
                     per-window mean and spread, and how often levels change
     diversity       spread of samples and distance to the closest training window
-NumPy and scikit-image are used for SSIM, which the spec allows here.
+    realism         the tutor's checks against the noise floor and the drift (realism.py)
+NumPy, SciPy and scikit-image are used here, which the spec allows.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from dataset import TICK, LOBSplits, OrderBook
 from helpers.metrics import (KL_TARGET, book_violations, decode_real_windows, decode_synthetic_windows, decode_windows,
                              distribution_report, kl_only, mid_moves, step_violations, vwap_changes,
                              vwap_depth, vwap_report)
+from helpers.realism import judge, realism_table, window_features
 from modules import SequenceGAN, TimeGAN
 
 SSIM_TARGET = 0.6         # spec target for SSIM of depth snapshots
@@ -305,10 +307,15 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
         recon_x = model.reconstruct(test_x.to(device)).cpu()
         vwap_sources["reconstructed_test"] = decode_windows(recon_x, splits.scaler, test_anchor,
                                                             splits.representation, splits.move_flag)
+    # The realism yardsticks need non-overlapping windows on the real side.
+    realism = judge(window_features(train_books),
+                    window_features([real_books[i] for i in splits.test.disjoint_indices()]),
+                    window_features(fake_books), seed=seed)
 
     summary = {
         "run": run_name,
         "model": type(model).__name__,
+        "ticker": splits.config.get("ticker", "AMZN"),
         "representation": splits.representation,
         "checkpoint_step": checkpoint_step,
         "parameters": model.parameter_counts()["total"],
@@ -330,6 +337,7 @@ def audit_run(model: SequenceGAN, splits: LOBSplits, run_name: str, checkpoint_s
         },
         "diversity_rms": {"synthetic": mean_pairwise_distance(fake_x), "real_test": mean_pairwise_distance(test_x)},
         "nearest_train_rms_median": nearest_train,
+        "realism": realism,
         "autopsy_cases": [{"case": label, "synthetic_index": j, "best_ssim": float(nearest[:, j].max())}
                           for label, j in cases],
     }
@@ -387,6 +395,9 @@ def print_summary(s: dict) -> None:
     print(f"  diversity (RMS)   synthetic {div['synthetic']:.4f}  real {div['real_test']:.4f}")
     print(f"  nearest training window (median RMS)  synthetic {near['synthetic']:.4f}  "
           f"real test {near['real_test']:.4f}")
+    if "realism" in s:
+        print()
+        print(realism_table(s["realism"], f"{s['run']}: realism checks"))
 
 
 # ---------------------------------------------------------------------------
