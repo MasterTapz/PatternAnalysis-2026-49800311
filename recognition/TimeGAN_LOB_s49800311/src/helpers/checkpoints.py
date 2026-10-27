@@ -29,12 +29,19 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>]_s<seed>.
+    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>]_s<seed>.
 
-    variant is timegan, nosup (no supervisor), rgan (plain baseline) or
-    rganm (baseline with the moment loss). Every option that changes the
-    results gets a suffix, so two different runs never share a folder.
+    data is <ticker>_<clock>_T<seq_len>[_v<eval stride>], with clock 1s for a
+    one-second clock or e10 for every 10th event, e.g. INTC_1s_T504_v24. It is
+    left out for the original setup (AMZN, e10, T64), so the older run folders
+    keep their names. variant is timegan, nosup (no supervisor), rgan (plain
+    baseline) or rganm (baseline with the moment loss). Every option that
+    changes the results gets a suffix, so two different runs never share a folder.
     """
+    clock = f"{args.clock_seconds:g}s" if args.clock_seconds > 0 else f"e{args.event_stride}"
+    data = f"{args.ticker}_{clock}_T{args.seq_len}"
+    data += f"_v{args.eval_stride}" if args.eval_stride else ""
+    prefix = "" if data == "AMZN_e10_T64" else f"{data}_"
     if args.model == "rgan":
         variant = "rganm" if args.baseline_moment_weight > 0 else "rgan"
     else:
@@ -47,7 +54,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix += f"_dw{args.difference_weight:g}" if args.difference_weight > 0 and args.model == "timegan" else ""
     suffix += f"_cc{args.change_corr_weight:g}" if args.change_corr_weight > 0 and args.model == "timegan" else ""
     suffix += f"_tw{args.tick_weight:g}" if args.tick_weight > 0 and args.model == "timegan" else ""
-    return f"{args.representation}_{variant}{suffix}_s{args.seed}"
+    return f"{prefix}{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
 def ladder_decoder(splits: LOBSplits) -> LadderTicks | None:

@@ -20,7 +20,8 @@ Examples (from the folder holding src/):
       --change-corr-weight 100
   python src/train.py --data-dir ../../../../data/LOBSTER --no-supervisor
   python src/train.py --data-dir ../../../../data/LOBSTER --model rgan --baseline-moment-weight 100
-  python src/train.py --data-dir ../../../../data/LOBSTER --ticker INTC --move-flag --static-noise-dim 8
+  python src/train.py --data-dir ../../../../data/LOBSTER --ticker INTC --clock-seconds 1 --seq-len 504 \
+      --eval-stride 24 --batch-size 64 --move-flag --static-noise-dim 8 --difference-weight 100 --tick-weight 2
   python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_timegan_s0 --resume
 """
 from __future__ import annotations
@@ -61,6 +62,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--clock-seconds", type=float, default=0,
                       help="Sample the book every this many seconds instead of every --event-stride events, "
                            "e.g. 1 (0 = event clock)")
+    data.add_argument("--eval-stride", type=int, default=None,
+                      help="Step between validation and test windows, e.g. 24 (default: --seq-len, no overlap)")
     data.add_argument("--move-flag", action="store_true", help="Add a binary mid-moved feature")
 
     model = p.add_argument_group("model")
@@ -381,7 +384,8 @@ def main(argv: list[str] | None = None) -> Path:
 
     splits = build_datasets(args.data_dir, ticker=args.ticker, seq_len=args.seq_len,
                             representation=args.representation, event_stride=args.event_stride,
-                            clock_seconds=args.clock_seconds, scaling=args.scaling, move_flag=args.move_flag)
+                            clock_seconds=args.clock_seconds, scaling=args.scaling, eval_stride=args.eval_stride,
+                            move_flag=args.move_flag)
     trainer = Trainer(args, splits, run_dir)
     if args.resume:
         trainer.load()
