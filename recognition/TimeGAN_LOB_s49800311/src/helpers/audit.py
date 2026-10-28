@@ -246,6 +246,12 @@ def pick_cases(stats: dict, nearest: np.ndarray) -> list[tuple[str, int]]:
     return cases
 
 
+def typical_pair(audit: RunAudit) -> tuple[OrderBook, OrderBook]:
+    """The typical (median SSIM) synthetic window and the real test window closest to it."""
+    j = dict(audit.cases)["typical (median SSIM)"]
+    return audit.real_books[int(np.argmax(audit.nearest[:, j]))], audit.fake_books[j]
+
+
 # ---------------------------------------------------------------------------
 # One run
 # ---------------------------------------------------------------------------

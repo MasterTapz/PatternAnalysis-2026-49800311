@@ -4,11 +4,13 @@ For each --run, loads best.pt with the data pipeline it was trained on,
 decodes synthetic windows into order books and scores them (validity, KL,
 SSIM, volatility clustering, price paths, VWAP, diversity) against the test
 hour (15:00 to 15:50). Results go to <run>/predict/. Several runs also get
-comparison tables. --export-assets copies the README figures into a folder.
+comparison tables. --gif animates a typical synthetic window next to its
+closest real one. --export-assets copies the README figures into a folder.
 
 Examples (from the folder holding src/):
   python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0
   python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0 runs/structured_rgan_s0
+  python src/predict.py --data-dir ../../../../data/LOBSTER --run runs/structured_timegan_s0 --gif
   python src/predict.py --export-assets assets
 """
 from __future__ import annotations
@@ -19,7 +21,9 @@ from pathlib import Path
 
 import torch
 
-from helpers.audit import RunAudit, audit_run, comparison_table, print_example_book, print_summary, vwap_table
+from helpers.animation import animate_grid, animate_pair
+from helpers.audit import (RunAudit, audit_run, comparison_table, print_example_book, print_summary, typical_pair,
+                           vwap_table)
 from helpers.checkpoints import load_run
 from helpers.realism import realism_table, ticker_report, ticker_tables
 from helpers.plotting import (export_readme_assets, plot_autopsy, plot_volatility_acf, plot_volatility_comparison,
@@ -36,6 +40,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", default="runs/comparison", help="Where the multi-run comparison goes")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--gif", action="store_true",
+                   help="Also write book.gif per ticker, and books_grid.gif for a run on several tickers")
     p.add_argument("--export-assets", default=None, metavar="DIR",
                    help="Copy the README figures out of --runs-dir into DIR and draw the ladder-rate figure")
     p.add_argument("--runs-dir", default="runs", help="Folder holding every run, read by --export-assets")
@@ -52,6 +58,8 @@ def audit_and_save(run_dir: Path, args: argparse.Namespace) -> list[RunAudit]:
 
     A run on several tickers is audited once per ticker, as <run>[<ticker>],
     into <run>/predict/<ticker>/; a conditional model samples that ticker.
+    With --gif, book.gif goes next to them, plus books_grid.gif with every
+    ticker for a run on several.
     """
     model, splits, state = load_run(run_dir, args.data_dir, args.device)
     audits = []
@@ -73,9 +81,15 @@ def audit_and_save(run_dir: Path, args: argparse.Namespace) -> list[RunAudit]:
                      out_dir / "autopsy.png")
         plot_volatility_acf(audit.acf, name, out_dir / "volatility_acf.png")
         plot_vwap(audit.vwap, name, out_dir / "vwap.png")
+        if args.gif:
+            animate_pair(*typical_pair(audit), f"{name}: typical synthetic window and its closest real test window",
+                         out_dir / "book.gif")
         (out_dir / "summary.json").write_text(json.dumps(audit.summary, indent=1))
         print_summary(audit.summary)
         audits.append(audit)
+    if args.gif and len(audits) > 1:
+        animate_grid({a.summary["ticker"]: typical_pair(a) for a in audits},
+                     f"{run_dir.name}: a typical window of each ticker", run_dir / "predict" / "books_grid.gif")
     return audits
 
 
