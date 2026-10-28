@@ -18,8 +18,8 @@ echo "Job $SLURM_JOB_ID on $(hostname), start $(date)"
 echo "Options: $*"
 nvidia-smi
 
-source "$HOME/miniconda3/bin/activate"
-conda activate torch
+# Name the env here: sourced with no arguments, activate would receive this script's train.py options.
+source "$HOME/miniconda3/bin/activate" torch
 DATA=${DATA:-$HOME/comp3710/data/LOBSTER}
 
 # train.py names the run from its options; ask it for the name so the audit can find the folder.
