@@ -32,12 +32,16 @@ Examples (from the folder holding src/):
       --eval-stride 24 --batch-size 64 --move-flag --static-noise-dim 8 --difference-weight 100 --tick-weight 2
   python src/train.py --data-dir ../../../../data/LOBSTER --tickers AAPL AMZN GOOG INTC MSFT --condition full \
       --clock-seconds 1 --seq-len 504 --eval-stride 24 --batch-size 65 --move-flag --static-noise-dim 8
+  python src/train.py --data-dir ../../../../data/LOBSTER --tickers AAPL AMZN GOOG INTC MSFT --condition full \
+      --clock-seconds 1 --seq-len 504 --eval-stride 24 --batch-size 65 --move-flag --static-noise-dim 8 \
+      --move-rate-weight 100 --lr-final 1e-4 --score-vwap --joint-steps 15000
   python src/train.py --data-dir ../../../../data/LOBSTER --run-name structured_timegan_s0 --resume
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
@@ -100,6 +104,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument("--book-weight", type=float, default=0.0,
                        help="TimeGAN weight of L_book, hinge penalties on spreads under one tick and "
                             "out-of-order levels (raw encoding only; 0 = off), e.g. 1, 10 or 100")
+    model.add_argument("--move-rate-weight", type=float, default=0.0,
+                       help="TimeGAN weight of L_M, which matches each ticker's share of steps where the mid "
+                            "moves (needs --move-flag; 0 = off), e.g. 100")
     model.add_argument("--no-supervisor", action="store_true", help="Ablation without the supervised loss")
     model.add_argument("--paper-weights", action="store_true",
                        help="Loss weights from the paper instead of the authors' code")
@@ -107,6 +114,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train = p.add_argument_group("training")
     train.add_argument("--batch-size", type=int, default=128)
     train.add_argument("--lr", type=float, default=1e-3)
+    train.add_argument("--lr-final", type=float, default=None,
+                       help="Cosine-decay every learning rate over the joint phase down to this, e.g. 1e-4 "
+                            "(default: constant --lr)")
     train.add_argument("--ae-steps", type=int, default=10_000)
     train.add_argument("--sup-steps", type=int, default=10_000)
     train.add_argument("--joint-steps", type=int, default=10_000)
@@ -122,6 +132,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--log-every", type=int, default=100)
     run.add_argument("--eval-every", type=int, default=500)
     run.add_argument("--eval-samples", type=int, default=512)
+    run.add_argument("--score-vwap", action="store_true",
+                     help="Add the validation VWAP-change KL to the score that picks best.pt")
     run.add_argument("--resume", action="store_true", help="Continue from <run>/last.pt")
 
     args = p.parse_args(argv)
@@ -131,6 +143,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--tick-weight needs the structured encoding")
     if args.book_weight > 0 and args.representation != "raw":
         p.error("--book-weight needs the raw encoding; the structured one is valid by construction")
+    if args.move_rate_weight > 0 and (not args.move_flag or args.model != "timegan"):
+        p.error("--move-rate-weight needs --move-flag and --model timegan")
     if args.tickers is not None:
         if len(set(args.tickers)) < 2:
             p.error("--tickers needs at least two different tickers; use --ticker for one")
@@ -193,11 +207,14 @@ class Trainer:
         self.args, self.splits, self.run_dir = args, splits, run_dir
         self.device = args.device
         single = splits[0] if len(splits) == 1 else None
-        self.model = build_model(args, len(splits[0].feature_names), single and ladder_decoder(single),
-                                 single and book_penalty(single), num_tickers=len(splits)).to(self.device)
+        names = splits[0].feature_names
+        move_column = names.index("mid_moved") if "mid_moved" in names else None
+        self.model = build_model(args, len(names), single and ladder_decoder(single), single and book_penalty(single),
+                                 num_tickers=len(splits), move_column=move_column).to(self.device)
         self.is_timegan = isinstance(self.model, TimeGAN)
         self.optimisers = self._build_optimisers()
-        self.evaluators = [Evaluator(s, self.device, args.eval_samples // len(splits), args.seed) for s in splits]
+        self.evaluators = [Evaluator(s, self.device, args.eval_samples // len(splits), args.seed, args.score_vwap)
+                           for s in splits]
         self.data = labelled_batches([s.train for s in splits], args.batch_size, args.seed, self.device)
         self.history = {"train": [], "val": [], "phases": {}}
         self.phase_index, self.step, self.best_score = 0, 0, float("inf")
@@ -218,6 +235,19 @@ class Trainer:
             if self.model.supervisor is not None:
                 optimisers["supervisor"] = adam(self.model.supervisor_parameters())
         return optimisers
+
+    def _set_joint_lr(self, total: int) -> None:
+        """With --lr-final, a cosine from --lr at the start of the joint phase to --lr-final at its end.
+
+        It depends only on the step, so a resumed run picks up the same rate.
+        """
+        if self.args.lr_final is None:
+            return
+        start, end = self.args.lr, self.args.lr_final
+        lr = end + 0.5 * (start - end) * (1 + math.cos(math.pi * self.step / total))
+        for opt in self.optimisers.values():
+            for group in opt.param_groups:
+                group["lr"] = lr
 
     # -- weight averaging ----------------------------------------------------
 
@@ -377,6 +407,8 @@ class Trainer:
             self._start_ema()
         self.model.train()
         while self.step < total:
+            if phase == "joint":
+                self._set_joint_lr(total)
             window.append(step_fn())
             if phase == "joint" and self.ema is not None:
                 self.ema.update_parameters(self.model)

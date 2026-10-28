@@ -27,11 +27,13 @@ class Evaluator:
     """Scores a model on the validation hour.
 
     The reference books are decoded once: every validation window and
-    non-overlapping training windows from all training hours.
+    non-overlapping training windows from all training hours. With
+    vwap_in_score the VWAP-change KL joins the score that picks best.pt.
     """
 
-    def __init__(self, splits: LOBSplits, device: str, n_samples: int, seed: int):
+    def __init__(self, splits: LOBSplits, device: str, n_samples: int, seed: int, vwap_in_score: bool = False):
         self.splits, self.device, self.n_samples = splits, device, n_samples
+        self.vwap_in_score = vwap_in_score
         self.val_x, self.val_anchor, self.val_books = decode_real_windows(splits, splits.val)
         _, _, self.train_books = decode_real_windows(splits, splits.train, splits.train.disjoint_indices())
         self.generator = torch.Generator().manual_seed(seed)   # for anchors only, separate from training
@@ -51,8 +53,11 @@ class Evaluator:
     def samples(self, model: SequenceGAN) -> dict[str, float]:
         """Validity and KL of synthetic books against validation and training data.
 
-        score = validation spread KL + validation return KL + any-violation rate.
-        The VWAP KLs are logged for monitoring only and do not enter the score.
+        score = validation spread KL + validation return KL + any-violation rate,
+        plus the VWAP-change KL with vwap_in_score. That KL sees how books move
+        between steps, which the other terms miss: a book that never changes
+        can score well on spread and return alone. Otherwise the VWAP KLs
+        are logged for monitoring only.
         """
         fake_x = model.sample(self.n_samples, self.splits.val.seq_len, self.device)
         fake = decode_synthetic_windows(self.splits, fake_x, self.val_anchor, self.generator)
@@ -61,6 +66,8 @@ class Evaluator:
         out.update({f"train_{k}": v for k, v in kl_only(distribution_report(self.train_books, fake)).items()})
         out.update({f"val_{k}": v for k, v in vwap_report(self.val_books, fake).items()})
         out["score"] = out["val_kl_spread"] + out["val_kl_return"] + out["any_violation_rate"]
+        if self.vwap_in_score:
+            out["score"] += out["val_kl_vwap_change"]
         return out
 
 

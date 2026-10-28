@@ -30,7 +30,8 @@ LAST_CHECKPOINT, BEST_CHECKPOINT = "last.pt", "best.pt"
 # ---------------------------------------------------------------------------
 
 def default_run_name(args: argparse.Namespace) -> str:
-    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_hf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>][_bw<w>]_s<seed>.
+    """[<data>_]<representation>_<variant>[_paper][_std][_mf][_hf][_ema][_sn<k>][_dw<w>][_cc<w>][_tw<w>][_bw<w>]
+    [_mr<w>][_cos<lr>][_sv][_j<k>k]_s<seed>.
 
     data is <ticker>_<clock>_T<seq_len>[_v<eval stride>], with clock 1s for a
     one-second clock or e10 for every 10th event, e.g. INTC_1s_T504_v24. It is
@@ -39,7 +40,9 @@ def default_run_name(args: argparse.Namespace) -> str:
     (e.g. 5stocks) and the variant gains _c<condition>. variant is timegan,
     nosup (no supervisor), rgan (plain baseline) or rganm (baseline with the
     moment loss). Every option that changes the results gets a suffix, so two
-    different runs never share a folder.
+    different runs never share a folder: _cos<lr> is a cosine decay to that
+    learning rate, _sv puts the VWAP change in the checkpoint score and
+    _j<k>k a joint phase other than 10k steps.
     """
     tickers = getattr(args, "tickers", None)
     clock = f"{args.clock_seconds:g}s" if args.clock_seconds > 0 else f"e{args.event_stride}"
@@ -61,6 +64,10 @@ def default_run_name(args: argparse.Namespace) -> str:
     suffix += f"_cc{args.change_corr_weight:g}" if args.change_corr_weight > 0 and args.model == "timegan" else ""
     suffix += f"_tw{args.tick_weight:g}" if args.tick_weight > 0 and args.model == "timegan" else ""
     suffix += f"_bw{args.book_weight:g}" if args.book_weight > 0 and args.model == "timegan" else ""
+    suffix += f"_mr{args.move_rate_weight:g}" if args.move_rate_weight > 0 and args.model == "timegan" else ""
+    suffix += f"_cos{args.lr_final:g}" if args.lr_final is not None else ""
+    suffix += "_sv" if args.score_vwap else ""
+    suffix += f"_j{args.joint_steps / 1000:g}k" if args.joint_steps != 10_000 else ""
     return f"{prefix}{args.representation}_{variant}{suffix}_s{args.seed}"
 
 
@@ -88,12 +95,14 @@ def book_penalty(splits: LOBSplits) -> RawBookPenalty | None:
 
 
 def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks | None = None,
-                book: RawBookPenalty | None = None, num_tickers: int = 1) -> SequenceGAN:
+                book: RawBookPenalty | None = None, num_tickers: int = 1,
+                move_column: int | None = None) -> SequenceGAN:
     """TimeGAN, its ablation or the baseline, as set on the command line.
 
     ladder is the decoder TimeGAN needs for L_P (see ladder_decoder) and
-    book the penalty behind L_book (see book_penalty). With several tickers
-    --condition sets the conditioning: full, concat or none (unconditional).
+    book the penalty behind L_book (see book_penalty). move_column is the
+    move flag's feature column, for L_M. With several tickers --condition
+    sets the conditioning: full, concat or none (unconditional).
     """
     condition = getattr(args, "condition", "full") if num_tickers > 1 else "none"
     conditioning = {} if condition == "none" else dict(
@@ -115,6 +124,8 @@ def build_model(args: argparse.Namespace, feature_dim: int, ladder: LadderTicks 
         change_corr_weight=args.change_corr_weight,
         tick_weight=args.tick_weight,
         book_weight=args.book_weight,
+        move_rate_weight=args.move_rate_weight,
+        move_column=move_column,
         **conditioning,
         **(paper if args.paper_weights else {}),
     ), ladder, book)
