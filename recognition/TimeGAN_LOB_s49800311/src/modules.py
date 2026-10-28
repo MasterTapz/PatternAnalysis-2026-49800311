@@ -288,6 +288,19 @@ def moment_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return std_term + mean_term
 
 
+def rate_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """L_M: gap in the mean and std of one feature, pooled over every window and step.
+
+    For the binary move flag the mean is the share of steps that move and the
+    std is sqrt(p (1 - p)). Output smeared at the right share matches the
+    mean but not the std, so both terms are needed to get real 0/1 moves.
+    Pooling over steps keeps a 4% rate measurable in a batch of 13 windows.
+    """
+    std_hat = torch.sqrt(x_hat.var(correction=0) + 1e-6)
+    std_real = torch.sqrt(x.var(correction=0) + 1e-6)
+    return (std_hat - std_real).abs() + (x_hat.mean() - x.mean()).abs()
+
+
 def difference_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """L_D: gap in the std and the mean absolute value of step changes, per feature.
 
@@ -434,7 +447,9 @@ class TimeGANConfig:
     tick_weight > 0 adds L_P, the L_D statistic on the ladder decoded into
     ticks, which needs a LadderTicks decoder when training. book_weight > 0
     adds L_book, the raw encoding's hinge penalties, which needs a
-    RawBookPenalty.
+    RawBookPenalty. move_rate_weight > 0 adds L_M on the move flag in column
+    move_column: L_V averages over every feature, so a stock that moves on 4%
+    of steps loses little by never moving.
 
     num_tickers > 0 makes one model for several tickers (0 = one ticker).
     The embedder, generator and supervisor see a ticker_dim embedding of the
@@ -463,6 +478,8 @@ class TimeGANConfig:
     change_corr_weight: float = 0.0
     tick_weight: float = 0.0
     book_weight: float = 0.0
+    move_rate_weight: float = 0.0
+    move_column: int | None = None
     recon_weight: float = 10.0
     embed_supervised_weight: float = 0.1
     sqrt_losses: bool = True
@@ -481,6 +498,8 @@ class TimeGANConfig:
             raise ValueError(f"rnn_type must be one of {tuple(RNN_TYPES)}")
         if self.num_tickers > 0 and (self.tick_weight > 0 or self.book_weight > 0):
             raise ValueError("L_P and L_book need a single ticker")
+        if self.move_rate_weight > 0 and self.move_column is None:
+            raise ValueError("move_rate_weight > 0 needs the move flag's column")
 
 
 class TimeGAN(SequenceGAN):
@@ -600,10 +619,12 @@ class TimeGAN(SequenceGAN):
             L_C    step-change correlation loss, weight change_corr_weight
             L_P    L_D on the ladder decoded into ticks, weight tick_weight
             L_book spread and ladder hinges on raw books, weight book_weight
+            L_M    move-flag rate and spread, within each ticker, weight move_rate_weight
 
         The recovery and discriminator are frozen, so gradients pass through
         them without changing them. L_D and L_C are logged even at weight 0,
-        and L_P and L_book whenever there is a decoder.
+        L_P and L_book whenever there is a decoder, and L_M whenever there is
+        a move flag.
         """
         c = self.config
         label = self._labels(label, x.shape[0], x.device)
@@ -641,6 +662,12 @@ class TimeGAN(SequenceGAN):
             if c.book_weight > 0:
                 loss = loss + c.book_weight * (spread_hinge + ladder_hinge)
             logs["book_spread"], logs["book_ladder"] = spread_hinge.detach(), ladder_hinge.detach()
+        if c.move_column is not None:
+            col = c.move_column
+            rates = self._per_ticker(rate_loss, x_hat[..., col], x[..., col], label)
+            if c.move_rate_weight > 0:
+                loss = loss + c.move_rate_weight * rates
+            logs["move_rate"] = rates.detach()
         if self.supervisor is not None:
             supervised = self._supervised_mse(h, label)
             loss = loss + c.eta * self._root(supervised)
