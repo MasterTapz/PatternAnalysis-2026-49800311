@@ -194,8 +194,8 @@ $$L_{disc} = \mathrm{BCE}(d(h), 1) + \mathrm{BCE}(d(\hat h), 0) + \mathrm{BCE}(d
 |---|---|---|
 | 1. Autoencoder | embedder, recovery | $10\sqrt{L_R}$ |
 | 2. Supervisor | supervisor | $L_S$ |
-| 3. Joint: generator step | generator, supervisor | $L_U + L_{U,e} + 100\sqrt{L_S} + 100\,L_V$ (with $L_V$ per stock) |
-| 3. Joint: embedder step | embedder, recovery | $10\sqrt{L_R} + 0.1\,L_S$ |
+| 3. Joint: generator step | generator, supervisor | $L_U + L_{U,e} + 100\sqrt{L_S} + 100 L_V$ (with $L_V$ per stock) |
+| 3. Joint: embedder step | embedder, recovery | $10\sqrt{L_R} + 0.1 L_S$ |
 | 3. Joint: discriminator step | discriminator | $L_{disc}$, skipped if it is already below 0.15 |
 
 These weights, the square roots, the 0.15 rule, the two generator and embedder updates per discriminator update and Adam at 1e-3 were all checked against the authors' released code [1] (`timegan.py` in the TimeGAN repository). The paper writes the losses without square roots; `--paper-weights` switches to that version.
